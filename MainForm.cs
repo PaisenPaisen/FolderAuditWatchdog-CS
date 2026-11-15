@@ -359,19 +359,27 @@ public class MainForm : Form
         SyncCombo(_cmbExpRepo, active);
     }
 
-    private static void SyncCombo(ComboBox cmb, List<string> codes)
+   private void SyncCombo(ComboBox cmb, List<string> codes)
     {
-        string? prev = cmb.SelectedItem?.ToString();
-        cmb.Items.Clear();
-        if (codes.Count > 0)
+        _isSyncingCombos = true;
+        try
         {
-            cmb.Items.AddRange(codes.ToArray());
-            cmb.SelectedItem = prev != null && codes.Contains(prev) ? prev : codes[0];
+            string? prev = cmb.SelectedItem?.ToString();
+            cmb.Items.Clear();
+            if (codes.Count > 0)
+            {
+                cmb.Items.AddRange(codes.ToArray());
+                cmb.SelectedItem = prev != null && codes.Contains(prev) ? prev : codes[0];
+            }
+            else
+            {
+                cmb.Items.Add("Brak");
+                cmb.SelectedIndex = 0;
+            }
         }
-        else
+        finally
         {
-            cmb.Items.Add("Brak");
-            cmb.SelectedIndex = 0;
+            _isSyncingCombos = false;
         }
     }
 
