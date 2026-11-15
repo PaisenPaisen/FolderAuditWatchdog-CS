@@ -22,6 +22,7 @@ public class MainForm : Form
     private List<ScanSnapshot> _dashSnapshotsCache = new();
     private int _currentScanPage = 0;
     private bool _isScanning = false;
+    private bool _isSyncingCombos = false;
 
     // Kontrolki nawigacji
     private TabControl _tabs = null!;
