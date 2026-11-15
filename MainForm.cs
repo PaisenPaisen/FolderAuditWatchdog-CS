@@ -536,29 +536,40 @@ public class MainForm : Form
         _lblRepoProgress.Visible = true;
         _lblRepoProgress.Text = "Inicjalizacja potoku skanowania...";
 
+        var profile = GetSelectedResourceProfile();
+        _pbRepoProgress.Style = ProgressBarStyle.Marquee;
+        _pbRepoProgress.Value = 0;
+
         var progress = new Progress<ScanProgressReport>(rep =>
         {
-          double doneMb = rep.ProcessedBytes / (1024.0 * 1024.0);
-          double totMb = rep.TotalDiscoveredBytes / (1024.0 * 1024.0);
+            double doneMb = rep.ProcessedBytes / (1024.0 * 1024.0);
+            double totMb = rep.TotalDiscoveredBytes / (1024.0 * 1024.0);
 
-         if (rep.DiscoveryCompleted && rep.TotalDiscoveredBytes > 0)
-      {
-        int pct = (int)Math.Clamp((rep.ProcessedBytes * 100L) / rep.TotalDiscoveredBytes, 0, 100);
-        _pbRepoProgress.Style = ProgressBarStyle.Continuous;
-        _pbRepoProgress.Value = pct;
-        _lblRepoProgress.Text = $"{rep.Phase}: {pct}% ({rep.SpeedMbPerSec:F0} MB/s)\nPliki: {rep.ProcessedFiles:N0}/{rep.TotalDiscoveredFiles:N0} ({doneMb:N0}/{totMb:N0} MB)";
-       }
-    else
-    {
-        _pbRepoProgress.Style = ProgressBarStyle.Marquee;
-        _lblRepoProgress.Text = $"Katalogowanie paczek (100/paczka)... ({rep.SpeedMbPerSec:F0} MB/s)\nPrzetworzono: {rep.ProcessedFiles:N0} z {rep.TotalDiscoveredFiles:N0} ({doneMb:N0} MB)";
-    }
-});
+            if (rep.DiscoveryCompleted && rep.TotalDiscoveredBytes > 0)
+            {
+                int pct = (int)Math.Clamp((rep.ProcessedBytes * 100L) / rep.TotalDiscoveredBytes, 0, 100);
+                _pbRepoProgress.Style = ProgressBarStyle.Continuous;
+                _pbRepoProgress.Value = pct;
+                _lblRepoProgress.Text = $"{rep.Phase}: {pct}% ({rep.SpeedMbPerSec:F0} MB/s)\nPliki: {rep.ProcessedFiles:N0}/{rep.TotalDiscoveredFiles:N0} ({doneMb:N0}/{totMb:N0} MB)";
+            }
+            else
+            {
+                _pbRepoProgress.Style = ProgressBarStyle.Marquee;
+                _lblRepoProgress.Text = $"Katalogowanie paczek (100/paczka)... ({rep.SpeedMbPerSec:F0} MB/s)\nPrzetworzono: {rep.ProcessedFiles:N0} z {rep.TotalDiscoveredFiles:N0} ({doneMb:N0} MB)";
+            }
+        });
 
         try
         {
             int count = await _engine.CreateBaselineStreamedAsync(
-                repoId, code, rootDir, owner, _currentUser, progress, _repoCreationCts.Token);
+                repoId,
+                code,
+                rootDir,
+                owner,
+                _currentUser,
+                profile,
+                progress,
+                _repoCreationCts.Token);
 
             _db.SetRepositoryStatus(repoId, "Active");
             LogAuditTrail(rootDir, "BASELINE_CREATED", code, $"Utworzono linię bazową dla {count} plików (Właściciel: {owner}).");
