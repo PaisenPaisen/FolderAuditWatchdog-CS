@@ -1,0 +1,48 @@
+name: Build Windows C# App
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore FolderAuditWatchdog.csproj
+
+      - name: Publish native Windows executable
+        run: |
+          dotnet publish FolderAuditWatchdog.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -o ./publish
+
+      - name: Generate SHA-256 Checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash ./publish/FolderAuditWatchdog.exe -Algorithm SHA256).Hash
+          "$hash  FolderAuditWatchdog.exe" | Out-File -FilePath ./publish/checksums.sha256 -Encoding utf8
+
+      - name: Upload Windows Executable Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FolderAuditWatchdog-Win64-CSharp
+          path: |
+            ./publish/FolderAuditWatchdog.exe
+            ./publish/checksums.sha256
