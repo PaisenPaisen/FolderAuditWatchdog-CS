@@ -1,7 +1,6 @@
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -29,8 +28,10 @@ public class MainForm : Form
     private CancellationTokenSource? _repoCreationCts;
     private CancellationTokenSource? _auditScanCts;
 
-    // Kontrolki nawigacji
-    private TabControl _tabs = null!;
+    // Nawigacja boczna (Sidebar) i panele zakładek
+    private readonly List<Button> _navButtons = new();
+    private readonly List<Panel> _pages = new();
+    private Label _lblPageHeader = null!;
 
     // Zakładka 0: Repozytoria
     private Label _lblPickedRepo = null!;
@@ -89,13 +90,16 @@ public class MainForm : Form
         _engine = new RepositoryEngine(_db);
 
         Text = "Folder Audit Watchdog – Nadzór Integralności Repozytoriów";
-        Size = new Size(1420, 850);
+        Size = new Size(1460, 880);
+        MinimumSize = new Size(1180, 720);
         StartPosition = FormStartPosition.CenterScreen;
-        Font = new Font("Segoe UI", 9.5f);
+        AutoScaleMode = AutoScaleMode.Dpi;
+        Font = UiTheme.FontBase();
+        BackColor = UiTheme.CanvasBg;
 
         SetupUi();
         RefreshRepositoriesList();
-        _tabs.SelectedIndex = 1; // Start w Monitorze Zmian
+        SelectPage(1); // Start w Monitorze Zmian
     }
 
     private string LoadVaultDir()
@@ -120,145 +124,313 @@ public class MainForm : Form
 
     private void SetupUi()
     {
-        // Górny pasek
-        var topBar = new Panel { Dock = DockStyle.Top, Height = 44, BackColor = Color.FromArgb(241, 245, 249), Padding = new Padding(12, 8, 12, 8) };
-        var lblDb = new Label { Text = $"Baza Audytu: {_vaultDir}", AutoSize = true, ForeColor = Color.FromArgb(31, 83, 141), Font = new Font("Segoe UI", 9.5f, FontStyle.Bold), Location = new Point(12, 12) };
-        var lblUser = new Label { Text = $"👤 Audytor: {_currentUser}", AutoSize = true, ForeColor = Color.FromArgb(16, 124, 65), Font = new Font("Segoe UI", 9.5f, FontStyle.Bold), Location = new Point(560, 12) };
-        var btnOpenDb = new Button { Text = "Otwórz folder bazy", Width = 145, Height = 28, Dock = DockStyle.Right };
-        btnOpenDb.Click += (s, e) => Process.Start("explorer.exe", _vaultDir);
-        topBar.Controls.AddRange(new Control[] { lblDb, lblUser, btnOpenDb });
-
-        // Zakładki główne
-        _tabs = new TabControl { Dock = DockStyle.Fill, Font = new Font("Segoe UI", 10f) };
-        var tRepos = new TabPage("📁 Repozytoria (Baseline)");
-        var tMonitor = new TabPage("🔍 Monitor Zmian");
-        var tExplorer = new TabPage("📂 Eksplorator");
-        var tDashboard = new TabPage("📈 Dashboard");
-        var tAudit = new TabPage("📜 Historia i Audyt");
-
-        _tabs.TabPages.AddRange(new[] { tRepos, tMonitor, tExplorer, tDashboard, tAudit });
-        _tabs.SelectedIndexChanged += (s, e) =>
+        // 1. LEWY SIDEBAR (NAWIGACJA)
+        var sidebar = new Panel
         {
-            switch (_tabs.SelectedIndex)
-            {
-                case 0: RefreshRepositoriesList(); break;
-                case 1: SyncRepoDropdowns(); break;
-                case 2: RefreshExplorerRepos(); break;
-                case 3: RefreshDashboardTab(); break;
-                case 4: RefreshAuditTab(); break;
-            }
+            Dock = DockStyle.Left,
+            Width = 245,
+            BackColor = UiTheme.SidebarBg,
+            Padding = new Padding(12, 18, 12, 14)
         };
 
-        BuildReposTab(tRepos);
-        BuildMonitorTab(tMonitor);
-        BuildExplorerTab(tExplorer);
-        BuildDashboardTab(tDashboard);
-        BuildAuditTab(tAudit);
+        var lblBrand = new Label
+        {
+            Text = "🛡️ AUDIT WATCHDOG",
+            Font = UiTheme.FontBase(12f, FontStyle.Bold),
+            ForeColor = Color.White,
+            Dock = DockStyle.Top,
+            Height = 32
+        };
 
-        Controls.Add(_tabs);
+        var lblSubBrand = new Label
+        {
+            Text = "Nadzór integralności plików",
+            Font = UiTheme.FontBase(8.5f),
+            ForeColor = Color.FromArgb(148, 163, 184),
+            Dock = DockStyle.Top,
+            Height = 26
+        };
+
+        sidebar.Controls.Add(lblSubBrand);
+        sidebar.Controls.Add(lblBrand);
+
+        var navItems = new[]
+        {
+            ("📁  Repozytoria (Baseline)", 0),
+            ("🔍  Monitor Zmian", 1),
+            ("📂  Eksplorator", 2),
+            ("📈  Dashboard", 3),
+            ("📜  Historia i Audyt", 4)
+        };
+
+        // Dodajemy przyciski nawigacji (od dołu do góry ze względu na DockStyle.Top)
+        foreach (var (text, idx) in navItems.Reverse())
+        {
+            var btn = new Button
+            {
+                Text = text,
+                Dock = DockStyle.Top,
+                Height = 44,
+                FlatStyle = FlatStyle.Flat,
+                ForeColor = Color.FromArgb(226, 232, 240),
+                BackColor = UiTheme.SidebarBg,
+                Font = UiTheme.FontBase(10f, FontStyle.Regular),
+                TextAlign = ContentAlignment.MiddleLeft,
+                Padding = new Padding(12, 0, 0, 0),
+                Cursor = Cursors.Hand,
+                Margin = new Padding(0, 4, 0, 4)
+            };
+            btn.FlatAppearance.BorderSize = 0;
+            btn.FlatAppearance.MouseOverBackColor = UiTheme.SidebarHover;
+            int targetIdx = idx;
+            btn.Click += (s, e) => SelectPage(targetIdx);
+
+            _navButtons.Insert(0, btn);
+            sidebar.Controls.Add(btn);
+            sidebar.Controls.SetChildIndex(btn, 0);
+        }
+
+        // Dolna karta operatora w sidebarze
+        var userCard = new Panel
+        {
+            Dock = DockStyle.Bottom,
+            Height = 68,
+            BackColor = Color.FromArgb(15, 23, 42),
+            Padding = new Padding(10, 8, 10, 8)
+        };
+        userCard.Controls.Add(new Label
+        {
+            Text = $"👤 {_currentUser}",
+            ForeColor = Color.FromArgb(74, 222, 128),
+            Font = UiTheme.FontBase(9.5f, FontStyle.Bold),
+            Dock = DockStyle.Bottom,
+            Height = 24
+        });
+        userCard.Controls.Add(new Label
+        {
+            Text = "AKTYWNY AUDYTOR SESJI",
+            ForeColor = Color.FromArgb(148, 163, 184),
+            Font = UiTheme.FontBase(7.5f, FontStyle.Bold),
+            Dock = DockStyle.Top,
+            Height = 18
+        });
+        sidebar.Controls.Add(userCard);
+
+        // 2. GÓRNY PASEK NAGŁÓWKA (TOP HEADER)
+        var topBar = new Panel
+        {
+            Dock = DockStyle.Top,
+            Height = 54,
+            BackColor = Color.White,
+            Padding = new Padding(20, 10, 20, 10)
+        };
+        topBar.Paint += (s, e) =>
+        {
+            using var pen = new Pen(UiTheme.CardBorder, 1);
+            e.Graphics.DrawLine(pen, 0, topBar.Height - 1, topBar.Width, topBar.Height - 1);
+        };
+
+        _lblPageHeader = new Label
+        {
+            Text = "Monitor Zmian",
+            Font = UiTheme.FontBase(13f, FontStyle.Bold),
+            ForeColor = UiTheme.TextPrimary,
+            AutoSize = true,
+            Location = new Point(20, 14)
+        };
+
+        var rightTopFlow = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Right,
+            AutoSize = true,
+            WrapContents = false,
+            FlowDirection = FlowDirection.LeftToRight
+        };
+
+        var lblDbPath = new Label
+        {
+            Text = $"Baza: {_vaultDir}",
+            ForeColor = UiTheme.TextSecondary,
+            Font = UiTheme.FontBase(8.5f),
+            AutoSize = true,
+            Margin = new Padding(0, 9, 14, 0)
+        };
+
+        var btnOpenDb = UiTheme.CreateSecondaryButton("📂 Folder bazy", height: 32);
+        btnOpenDb.Click += (s, e) => Process.Start("explorer.exe", _vaultDir);
+
+        rightTopFlow.Controls.Add(lblDbPath);
+        rightTopFlow.Controls.Add(btnOpenDb);
+
+        topBar.Controls.Add(_lblPageHeader);
+        topBar.Controls.Add(rightTopFlow);
+
+        // 3. KONTENER GŁÓWNEJ TREŚCI (CONTENT HOST)
+        var contentHost = new Panel
+        {
+            Dock = DockStyle.Fill,
+            Padding = new Padding(16),
+            BackColor = UiTheme.CanvasBg
+        };
+
+        for (int i = 0; i < 5; i++)
+        {
+            var page = new Panel { Dock = DockStyle.Fill, Visible = false };
+            _pages.Add(page);
+            contentHost.Controls.Add(page);
+        }
+
+        BuildReposTab(_pages[0]);
+        BuildMonitorTab(_pages[1]);
+        BuildExplorerTab(_pages[2]);
+        BuildDashboardTab(_pages[3]);
+        BuildAuditTab(_pages[4]);
+
+        Controls.Add(contentHost);
         Controls.Add(topBar);
+        Controls.Add(sidebar);
+    }
+
+    private void SelectPage(int index)
+    {
+        string[] titles =
+        {
+            "Zarządzanie Repozytoriami i Linią Bazową",
+            "Monitor Zmian i Weryfikacja Integralności",
+            "Eksplorator Struktury Repozytorium",
+            "Dashboard Analityczny i Trendy Integralności",
+            "Historia Audytu i Raportowanie PDF"
+        };
+
+        _lblPageHeader.Text = titles[index];
+
+        for (int i = 0; i < _pages.Count; i++)
+        {
+            bool active = i == index;
+            _pages[i].Visible = active;
+            _navButtons[i].BackColor = active ? UiTheme.SidebarActive : UiTheme.SidebarBg;
+            _navButtons[i].Font = UiTheme.FontBase(10f, active ? FontStyle.Bold : FontStyle.Regular);
+            _navButtons[i].ForeColor = active ? Color.White : Color.FromArgb(203, 213, 225);
+        }
+
+        switch (index)
+        {
+            case 0: RefreshRepositoriesList(); break;
+            case 1: SyncRepoDropdowns(); break;
+            case 2: RefreshExplorerRepos(); break;
+            case 3: RefreshDashboardTab(); break;
+            case 4: RefreshAuditTab(); break;
+        }
     }
 
     // =========================================================================
-    // ZAKŁADKA 0: REPOZYTORIA (Z IZOLOWANYM POSTĘPEM I ANULOWANIEM)
+    // ZAKŁADKA 0: REPOZYTORIA
     // =========================================================================
-    private void BuildReposTab(TabPage tab)
+    private void BuildReposTab(Panel page)
     {
-        var split = new SplitContainer { Dock = DockStyle.Fill, SplitterDistance = 390, FixedPanel = FixedPanel.Panel1, Padding = new Padding(10) };
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1 };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 400f));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
 
-        var left = split.Panel1;
-        int y = 15;
-        left.Controls.Add(new Label { Text = "Dodaj lokalizację do nadzoru", Font = new Font("Segoe UI", 11, FontStyle.Bold), Location = new Point(10, y), AutoSize = true });
-        y += 35;
+        // Lewa karta formularza
+        var leftCard = UiTheme.CreateCardPanel(new Padding(18));
+        leftCard.Dock = DockStyle.Fill;
+        leftCard.Margin = new Padding(0, 0, 12, 0);
 
-        left.Controls.Add(new Label { Text = "1. Wskaż katalog na dysku lub sieci:", Font = new Font("Segoe UI", 9, FontStyle.Bold), Location = new Point(10, y), AutoSize = true });
-        y += 22;
-        var btnPick = new Button { Text = "📁 Wybierz folder...", Location = new Point(10, y), Size = new Size(350, 32) };
+        var formFlow = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.TopDown,
+            WrapContents = false,
+            AutoScroll = true
+        };
+
+        formFlow.Controls.Add(new Label
+        {
+            Text = "Nowa lokalizacja pod nadzorem",
+            Font = UiTheme.FontBase(11.5f, FontStyle.Bold),
+            ForeColor = UiTheme.TextPrimary,
+            AutoSize = true,
+            Margin = new Padding(0, 0, 0, 14)
+        });
+
+        formFlow.Controls.Add(MakeFieldLabel("1. Katalog na dysku lub zasobie sieciowym:"));
+        var btnPick = UiTheme.CreateSecondaryButton("📁 Wybierz folder...", width: 355, height: 36);
         btnPick.Click += (s, e) => PickRepoFolder();
-        left.Controls.Add(btnPick);
-        y += 38;
+        formFlow.Controls.Add(btnPick);
 
-        _lblPickedRepo = new Label { Text = "Nie wybrano folderu", ForeColor = Color.Gray, Location = new Point(10, y), Size = new Size(350, 36) };
-        left.Controls.Add(_lblPickedRepo);
-        y += 42;
-
-        left.Controls.Add(new Label { Text = "2. Kod identyfikacyjny (np. INV-01):", Font = new Font("Segoe UI", 9, FontStyle.Bold), Location = new Point(10, y), AutoSize = true });
-        y += 22;
-        _txtRepoCode = new TextBox { PlaceholderText = "np. LINIA-ASEPT", Location = new Point(10, y), Size = new Size(350, 26) };
-        left.Controls.Add(_txtRepoCode);
-        y += 36;
-
-        left.Controls.Add(new Label { Text = "3. Nazwa opisowa repozytorium:", Font = new Font("Segoe UI", 9, FontStyle.Bold), Location = new Point(10, y), AutoSize = true });
-        y += 22;
-        _txtRepoName = new TextBox { PlaceholderText = "np. Dokumentacja Budowy Linii", Location = new Point(10, y), Size = new Size(350, 26) };
-        left.Controls.Add(_txtRepoName);
-        y += 36;
-
-        left.Controls.Add(new Label { Text = "4. Osoba odpowiedzialna / Audytor:", Font = new Font("Segoe UI", 9, FontStyle.Bold), Location = new Point(10, y), AutoSize = true });
-        y += 22;
-        _txtRepoOwner = new TextBox { Text = _currentUser, Location = new Point(10, y), Size = new Size(350, 26) };
-        left.Controls.Add(_txtRepoOwner);
-        y += 45;
-
-        _btnCreateRepo = new Button
+        _lblPickedRepo = new Label
         {
-            Text = "🛡️ Utwórz Linię Bazową (Baseline)",
-            BackColor = Color.FromArgb(16, 124, 65),
-            ForeColor = Color.White,
-            FlatStyle = FlatStyle.Flat,
-            Font = new Font("Segoe UI", 10, FontStyle.Bold),
-            Location = new Point(10, y),
-            Size = new Size(350, 40)
+            Text = "Nie wybrano folderu",
+            ForeColor = UiTheme.TextSecondary,
+            Font = UiTheme.FontBase(8.5f),
+            Size = new Size(355, 36),
+            Margin = new Padding(0, 6, 0, 10)
         };
+        formFlow.Controls.Add(_lblPickedRepo);
+
+        formFlow.Controls.Add(MakeFieldLabel("2. Kod identyfikacyjny (np. INV-01):"));
+        _txtRepoCode = new TextBox { PlaceholderText = "np. LINIA-ASEPT", Width = 355, Font = UiTheme.FontBase(10f), Margin = new Padding(0, 0, 0, 12) };
+        formFlow.Controls.Add(_txtRepoCode);
+
+        formFlow.Controls.Add(MakeFieldLabel("3. Nazwa opisowa repozytorium:"));
+        _txtRepoName = new TextBox { PlaceholderText = "np. Dokumentacja Budowy Linii", Width = 355, Font = UiTheme.FontBase(10f), Margin = new Padding(0, 0, 0, 12) };
+        formFlow.Controls.Add(_txtRepoName);
+
+        formFlow.Controls.Add(MakeFieldLabel("4. Osoba odpowiedzialna / Audytor:"));
+        _txtRepoOwner = new TextBox { Text = _currentUser, Width = 355, Font = UiTheme.FontBase(10f), Margin = new Padding(0, 0, 0, 18) };
+        formFlow.Controls.Add(_txtRepoOwner);
+
+        _btnCreateRepo = UiTheme.CreatePrimaryButton("🛡️ Utwórz Linię Bazową (Baseline)", UiTheme.SuccessGreen, UiTheme.SuccessGreenHover, width: 355, height: 42);
         _btnCreateRepo.Click += async (s, e) => await RegisterNewRepositoryAsync();
-        left.Controls.Add(_btnCreateRepo);
+        formFlow.Controls.Add(_btnCreateRepo);
 
-        _pbRepoProgress = new ProgressBar
-        {
-            Location = new Point(10, y + 48),
-            Size = new Size(255, 22),
-            Style = ProgressBarStyle.Marquee,
-            MarqueeAnimationSpeed = 25,
-            Visible = false
-        };
-
-        _btnCancelRepo = new Button
-        {
-            Text = "Anuluj",
-            Location = new Point(275, y + 46),
-            Size = new Size(85, 26),
-            Visible = false
-        };
+        var progPanel = new FlowLayoutPanel { Width = 355, Height = 36, WrapContents = false, Margin = new Padding(0, 10, 0, 0) };
+        _pbRepoProgress = new ProgressBar { Width = 260, Height = 24, Style = ProgressBarStyle.Marquee, MarqueeAnimationSpeed = 25, Visible = false, Margin = new Padding(0, 4, 8, 0) };
+        _btnCancelRepo = UiTheme.CreateSecondaryButton("Anuluj", width: 85, height: 28);
+        _btnCancelRepo.Visible = false;
         _btnCancelRepo.Click += (s, e) => _repoCreationCts?.Cancel();
+        progPanel.Controls.AddRange(new Control[] { _pbRepoProgress, _btnCancelRepo });
+        formFlow.Controls.Add(progPanel);
 
         _lblRepoProgress = new Label
         {
             Text = "",
-            Location = new Point(10, y + 76),
-            Size = new Size(350, 42),
-            ForeColor = Color.FromArgb(31, 83, 141),
-            Font = new Font("Segoe UI", 8.5f),
-            Visible = false
+            Size = new Size(355, 44),
+            ForeColor = UiTheme.PrimaryBlue,
+            Font = UiTheme.FontBase(8.5f),
+            Visible = false,
+            Margin = new Padding(0, 4, 0, 0)
         };
+        formFlow.Controls.Add(_lblRepoProgress);
 
-        left.Controls.AddRange(new Control[] { _pbRepoProgress, _btnCancelRepo, _lblRepoProgress });
+        leftCard.Controls.Add(formFlow);
 
-        // Prawy panel listy
-        var right = split.Panel2;
-        var topR = new Panel { Dock = DockStyle.Top, Height = 36 };
-        topR.Controls.Add(new Label { Text = "Nadzorowane Repozytoria", Font = new Font("Segoe UI", 11, FontStyle.Bold), Location = new Point(5, 7), AutoSize = true });
-        _chkRepoArch = new CheckBox { Text = "Pokaż zarchiwizowane", AutoSize = true, Dock = DockStyle.Right };
+        // Prawa karta listy repozytoriów
+        var rightCard = UiTheme.CreateCardPanel(new Padding(16));
+        rightCard.Dock = DockStyle.Fill;
+
+        var topR = new Panel { Dock = DockStyle.Top, Height = 38 };
+        topR.Controls.Add(new Label
+        {
+            Text = "Nadzorowane Repozytoria",
+            Font = UiTheme.FontBase(11.5f, FontStyle.Bold),
+            ForeColor = UiTheme.TextPrimary,
+            AutoSize = true,
+            Location = new Point(0, 6)
+        });
+        _chkRepoArch = new CheckBox { Text = "Pokaż zarchiwizowane", AutoSize = true, Dock = DockStyle.Right, ForeColor = UiTheme.TextSecondary };
         _chkRepoArch.CheckedChanged += (s, e) => RefreshRepositoriesList();
         topR.Controls.Add(_chkRepoArch);
 
-        var botR = new Panel { Dock = DockStyle.Bottom, Height = 40, Padding = new Padding(0, 6, 0, 0) };
-        var btnOpenDir = new Button { Text = "Otwórz folder w Eksploratorze", Width = 200, Height = 30, Location = new Point(5, 6) };
+        var botR = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 44, Padding = new Padding(0, 8, 0, 0) };
+        var btnOpenDir = UiTheme.CreateSecondaryButton("📂 Otwórz folder w Eksploratorze", height: 32);
         btnOpenDir.Click += (s, e) =>
         {
             if (_gridRepos.CurrentRow?.DataBoundItem is RepositoryInfo r && Directory.Exists(r.RootPath))
                 Process.Start("explorer.exe", r.RootPath);
         };
-        var btnArch = new Button { Text = "Zarchiwizuj / Przywróć", Width = 160, Height = 30, Location = new Point(215, 6) };
+        var btnArch = UiTheme.CreateSecondaryButton("📦 Zarchiwizuj / Przywróć", height: 32);
         btnArch.Click += (s, e) =>
         {
             if (_gridRepos.CurrentRow?.DataBoundItem is RepositoryInfo r)
@@ -276,23 +448,36 @@ public class MainForm : Form
         };
         botR.Controls.AddRange(new Control[] { btnOpenDir, btnArch });
 
-        _gridRepos = CreateStyledGrid();
+        _gridRepos = UiTheme.CreateModernGrid();
+        _gridRepos.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         _gridRepos.Columns.AddRange(new DataGridViewColumn[]
         {
-            new DataGridViewTextBoxColumn { DataPropertyName = "Id", HeaderText = "ID", Width = 45 },
-            new DataGridViewTextBoxColumn { DataPropertyName = "Code", HeaderText = "Kod", Width = 110 },
-            new DataGridViewTextBoxColumn { DataPropertyName = "Name", HeaderText = "Nazwa", Width = 180 },
-            new DataGridViewTextBoxColumn { DataPropertyName = "RootPath", HeaderText = "Ścieżka na dysku", Width = 280 },
-            new DataGridViewTextBoxColumn { DataPropertyName = "Owner", HeaderText = "Właściciel", Width = 120 },
-            new DataGridViewTextBoxColumn { DataPropertyName = "Status", HeaderText = "Status", Width = 80 },
-            new DataGridViewTextBoxColumn { DataPropertyName = "LastScanAt", HeaderText = "Ostatni skan", Width = 135 }
+            new DataGridViewTextBoxColumn { DataPropertyName = "Id", HeaderText = "ID", FillWeight = 7 },
+            new DataGridViewTextBoxColumn { DataPropertyName = "Code", HeaderText = "Kod", FillWeight = 15 },
+            new DataGridViewTextBoxColumn { DataPropertyName = "Name", HeaderText = "Nazwa", FillWeight = 22 },
+            new DataGridViewTextBoxColumn { DataPropertyName = "RootPath", HeaderText = "Ścieżka na dysku", FillWeight = 28 },
+            new DataGridViewTextBoxColumn { DataPropertyName = "Owner", HeaderText = "Właściciel", FillWeight = 12 },
+            new DataGridViewTextBoxColumn { DataPropertyName = "Status", HeaderText = "Status", FillWeight = 10 },
+            new DataGridViewTextBoxColumn { DataPropertyName = "LastScanAt", HeaderText = "Ostatni skan", FillWeight = 16 }
         });
 
-        right.Controls.Add(_gridRepos);
-        right.Controls.Add(topR);
-        right.Controls.Add(botR);
-        tab.Controls.Add(split);
+        rightCard.Controls.Add(_gridRepos);
+        rightCard.Controls.Add(topR);
+        rightCard.Controls.Add(botR);
+
+        layout.Controls.Add(leftCard, 0, 0);
+        layout.Controls.Add(rightCard, 1, 0);
+        page.Controls.Add(layout);
     }
+
+    private static Label MakeFieldLabel(string text) => new()
+    {
+        Text = text,
+        Font = UiTheme.FontBase(9f, FontStyle.Bold),
+        ForeColor = UiTheme.TextPrimary,
+        AutoSize = true,
+        Margin = new Padding(0, 0, 0, 5)
+    };
 
     private void PickRepoFolder()
     {
@@ -301,7 +486,7 @@ public class MainForm : Form
         {
             _selectedNewRepoDir = fbd.SelectedPath;
             _lblPickedRepo.Text = _selectedNewRepoDir;
-            _lblPickedRepo.ForeColor = Color.FromArgb(16, 124, 65);
+            _lblPickedRepo.ForeColor = UiTheme.SuccessGreen;
             string dirName = Path.GetFileName(_selectedNewRepoDir.TrimEnd('\\', '/'));
             if (string.IsNullOrWhiteSpace(_txtRepoCode.Text))
                 _txtRepoCode.Text = SanitizeCode(dirName);
@@ -369,7 +554,7 @@ public class MainForm : Form
             _txtRepoName.Clear();
             _selectedNewRepoDir = null;
             _lblPickedRepo.Text = "Nie wybrano folderu";
-            _lblPickedRepo.ForeColor = Color.Gray;
+            _lblPickedRepo.ForeColor = UiTheme.TextSecondary;
 
             RefreshRepositoriesList();
             SyncRepoDropdowns();
@@ -431,117 +616,135 @@ public class MainForm : Form
     }
 
     // =========================================================================
-    // ZAKŁADKA 1: MONITOR ZMIAN (ZOPTYMALIZOWANE SKANOWANIE I RENDEROWANIE)
+    // ZAKŁADKA 1: MONITOR ZMIAN
     // =========================================================================
-    private void BuildMonitorTab(TabPage tab)
+    private void BuildMonitorTab(Panel page)
     {
-        var container = new Panel { Dock = DockStyle.Fill, Padding = new Padding(12) };
+        var card = UiTheme.CreateCardPanel(new Padding(16));
+        card.Dock = DockStyle.Fill;
 
-        // Pasek 1: Sterowanie skanem
-        var pTop = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 40, WrapContents = false };
-        pTop.Controls.Add(new Label { Text = "Repozytorium:", AutoSize = true, Margin = new Padding(0, 7, 5, 0), Font = new Font("Segoe UI", 9, FontStyle.Bold) });
-        _cmbMonRepo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 170 };
+        // Pasek 1: Sterowanie skanowaniem
+        var pTop = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 46, WrapContents = false };
+        pTop.Controls.Add(new Label { Text = "Repozytorium:", AutoSize = true, Margin = new Padding(0, 9, 6, 0), Font = UiTheme.FontBase(9.5f, FontStyle.Bold) });
+        _cmbMonRepo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 180, Margin = new Padding(0, 5, 10, 0) };
         pTop.Controls.Add(_cmbMonRepo);
 
-        _btnScanFast = new Button { Text = "🔍 Skanuj zmiany (Fast-Path)", BackColor = Color.FromArgb(16, 124, 65), ForeColor = Color.White, FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 9, FontStyle.Bold), Width = 195, Height = 29, Margin = new Padding(8, 2, 4, 0) };
+        _btnScanFast = UiTheme.CreatePrimaryButton("🔍 Skanuj zmiany (Fast-Path)", UiTheme.SuccessGreen, UiTheme.SuccessGreenHover, height: 34);
+        _btnScanFast.Margin = new Padding(0, 2, 6, 0);
         _btnScanFast.Click += async (s, e) => await RunRepositoryAuditScanAsync(false);
         pTop.Controls.Add(_btnScanFast);
 
-        _btnScanDeep = new Button { Text = "🔐 Pełny audyt SHA-256", Width = 165, Height = 29, Margin = new Padding(4, 2, 4, 0) };
+        _btnScanDeep = UiTheme.CreateSecondaryButton("🔐 Pełny audyt SHA-256", height: 34);
+        _btnScanDeep.Margin = new Padding(0, 2, 6, 0);
         _btnScanDeep.Click += async (s, e) => await RunRepositoryAuditScanAsync(true);
         pTop.Controls.Add(_btnScanDeep);
 
-        _btnCancelScan = new Button { Text = "⏹ Anuluj", Width = 75, Height = 29, Margin = new Padding(2, 2, 8, 0), Visible = false };
+        _btnCancelScan = UiTheme.CreateSecondaryButton("⏹ Anuluj", height: 34);
+        _btnCancelScan.Margin = new Padding(0, 2, 10, 0);
+        _btnCancelScan.Visible = false;
         _btnCancelScan.Click += (s, e) => _auditScanCts?.Cancel();
         pTop.Controls.Add(_btnCancelScan);
 
-        _chkMtimeOnly = new CheckBox { Text = "Traktuj zmianę mtime jako zmianę", AutoSize = true, Margin = new Padding(6, 6, 8, 0) };
+        _chkMtimeOnly = new CheckBox { Text = "Zmiana mtime = zmiana pliku", AutoSize = true, Margin = new Padding(6, 9, 12, 0), ForeColor = UiTheme.TextSecondary };
         _chkMtimeOnly.CheckedChanged += async (s, e) => { if (!_isScanning && _cmbMonRepo.Text != "Brak") await RunRepositoryAuditScanAsync(false); };
         var tt = new ToolTip();
         tt.SetToolTip(_chkMtimeOnly, "Jeżeli włączone, plik jest oznaczany jako zmieniony nawet przy identycznym rozmiarze i zawartości, jeśli zmieniła się data modyfikacji.");
         pTop.Controls.Add(_chkMtimeOnly);
 
-        _lblMonSummary = new Label { Text = "Wybierz repozytorium i uruchom skanowanie", AutoSize = true, ForeColor = Color.DimGray, Font = new Font("Segoe UI", 9.5f, FontStyle.Bold), Margin = new Padding(12, 6, 0, 0) };
+        _lblMonSummary = new Label { Text = "Wybierz repozytorium i uruchom skanowanie", AutoSize = true, ForeColor = UiTheme.TextSecondary, Font = UiTheme.FontBase(9.5f, FontStyle.Bold), Margin = new Padding(8, 9, 0, 0) };
         pTop.Controls.Add(_lblMonSummary);
 
-        // Pasek 2: Filtry
-        var pFlt = new Panel { Dock = DockStyle.Top, Height = 36 };
-        pFlt.Controls.Add(new Label { Text = "Filtr stanu:", AutoSize = true, Location = new Point(0, 8), Font = new Font("Segoe UI", 9, FontStyle.Bold) });
-        _cmbMonFilter = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Location = new Point(75, 4), Width = 310 };
+        // Pasek 2: Filtry i eksport
+        var pFlt = new Panel { Dock = DockStyle.Top, Height = 44, Padding = new Padding(0, 4, 0, 6) };
+        var fltLeft = new FlowLayoutPanel { Dock = DockStyle.Left, AutoSize = true, WrapContents = false };
+        fltLeft.Controls.Add(new Label { Text = "Filtr:", AutoSize = true, Margin = new Padding(0, 7, 6, 0), Font = UiTheme.FontBase(9f, FontStyle.Bold) });
+
+        _cmbMonFilter = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 310, Margin = new Padding(0, 3, 14, 0) };
         _cmbMonFilter.Items.AddRange(new object[] { "Tylko rozbieżności (Nowe / Zmienione / Usunięte)", "Wszystkie pliki", "ZMODYFIKOWANE", "NOWE", "USUNIĘTE", "ZGODNE" });
         _cmbMonFilter.SelectedIndex = 0;
         _cmbMonFilter.SelectedIndexChanged += (s, e) => ApplyMonitorFilters(true);
-        pFlt.Controls.Add(_cmbMonFilter);
+        fltLeft.Controls.Add(_cmbMonFilter);
 
-        pFlt.Controls.Add(new Label { Text = "Szukaj:", AutoSize = true, Location = new Point(400, 8), Font = new Font("Segoe UI", 9, FontStyle.Bold) });
-        _txtMonSearch = new TextBox { PlaceholderText = "Fragment nazwy lub ścieżki...", Location = new Point(455, 4), Width = 240 };
+        fltLeft.Controls.Add(new Label { Text = "Szukaj:", AutoSize = true, Margin = new Padding(0, 7, 6, 0), Font = UiTheme.FontBase(9f, FontStyle.Bold) });
+        _txtMonSearch = new TextBox { PlaceholderText = "Fragment nazwy lub ścieżki...", Width = 250, Margin = new Padding(0, 3, 0, 0) };
         _txtMonSearch.TextChanged += (s, e) => ApplyMonitorFilters(true);
-        pFlt.Controls.Add(_txtMonSearch);
+        fltLeft.Controls.Add(_txtMonSearch);
 
-        var btnCsv = new Button { Text = "Eksport raportu CSV", Width = 150, Height = 28, Dock = DockStyle.Right };
+        var btnCsv = UiTheme.CreateSecondaryButton("📄 Eksport CSV", height: 32);
+        btnCsv.Dock = DockStyle.Right;
         btnCsv.Click += (s, e) => ExportMonitorCsv();
+
+        pFlt.Controls.Add(fltLeft);
         pFlt.Controls.Add(btnCsv);
 
         // Pasek 3 (dół): Akcje Baseline
-        var pAct = new Panel { Dock = DockStyle.Bottom, Height = 40, Padding = new Padding(0, 6, 0, 0) };
-        var btnOpen = new Button { Text = "Otwórz plik", Width = 110, Height = 30, Location = new Point(0, 6) };
+        var pAct = new Panel { Dock = DockStyle.Bottom, Height = 46, Padding = new Padding(0, 8, 0, 0) };
+        var actLeft = new FlowLayoutPanel { Dock = DockStyle.Left, AutoSize = true, WrapContents = false };
+        var btnOpen = UiTheme.CreateSecondaryButton("Otwórz plik", height: 34);
         btnOpen.Click += (s, e) => MonOpenFile();
-        var btnLoc = new Button { Text = "📂 Pokaż w Eksploratorze", BackColor = Color.FromArgb(0, 120, 212), ForeColor = Color.White, FlatStyle = FlatStyle.Flat, Width = 185, Height = 30, Location = new Point(118, 6) };
+        var btnLoc = UiTheme.CreatePrimaryButton("📂 Pokaż w Eksploratorze", UiTheme.PrimaryBlue, UiTheme.PrimaryBlueHover, height: 34);
         btnLoc.Click += (s, e) => MonLocateInExplorer();
+        actLeft.Controls.AddRange(new Control[] { btnOpen, btnLoc });
 
-        var btnAccAll = new Button { Text = "✅ Zatwierdź wszystkie rozbieżności (Nowy Baseline)", BackColor = Color.FromArgb(16, 124, 65), ForeColor = Color.White, FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 9, FontStyle.Bold), Width = 330, Height = 30, Dock = DockStyle.Right };
-        btnAccAll.Click += async (s, e) => await AcceptChangesToBaselineAsync(false);
-
-        var btnAccSel = new Button { Text = "✔ Zatwierdź zaznaczone do Baseline", BackColor = Color.FromArgb(31, 83, 141), ForeColor = Color.White, FlatStyle = FlatStyle.Flat, Width = 235, Height = 30, Dock = DockStyle.Right };
+        var actRight = new FlowLayoutPanel { Dock = DockStyle.Right, AutoSize = true, WrapContents = false };
+        var btnAccSel = UiTheme.CreatePrimaryButton("✔ Zatwierdź zaznaczone", UiTheme.PrimaryBlue, UiTheme.PrimaryBlueHover, height: 34);
         btnAccSel.Click += async (s, e) => await AcceptChangesToBaselineAsync(true);
+        var btnAccAll = UiTheme.CreatePrimaryButton("✅ Zatwierdź wszystkie rozbieżności", UiTheme.SuccessGreen, UiTheme.SuccessGreenHover, height: 34);
+        btnAccAll.Click += async (s, e) => await AcceptChangesToBaselineAsync(false);
+        actRight.Controls.AddRange(new Control[] { btnAccSel, btnAccAll });
 
-        pAct.Controls.AddRange(new Control[] { btnOpen, btnLoc, btnAccSel, btnAccAll });
+        pAct.Controls.Add(actLeft);
+        pAct.Controls.Add(actRight);
 
         // Pasek 4 (nad akcjami): Paginacja
-        var pPage = new Panel { Dock = DockStyle.Bottom, Height = 32 };
-        _btnMonPrev = new Button { Text = "◀ Poprzednia", Width = 105, Height = 26, Location = new Point(0, 3) };
+        var pPage = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 36, Padding = new Padding(0, 4, 0, 0) };
+        _btnMonPrev = UiTheme.CreateSecondaryButton("◀ Poprzednia", height: 28);
         _btnMonPrev.Click += (s, e) => { if (_currentScanPage > 0) { _currentScanPage--; RenderMonitorPage(); } };
-        _lblMonPage = new Label { Text = "Strona 1 z 1 (0 pozycji)", AutoSize = true, Font = new Font("Segoe UI", 9, FontStyle.Bold), Location = new Point(118, 7) };
-        _btnMonNext = new Button { Text = "Następna ▶", Width = 105, Height = 26, Location = new Point(310, 3) };
+        _lblMonPage = new Label { Text = "Strona 1 z 1 (0 pozycji)", AutoSize = true, Font = UiTheme.FontBase(9f, FontStyle.Bold), ForeColor = UiTheme.TextSecondary, Margin = new Padding(12, 6, 12, 0) };
+        _btnMonNext = UiTheme.CreateSecondaryButton("Następna ▶", height: 28);
         _btnMonNext.Click += (s, e) => { int maxP = Math.Max(0, (_filteredScanCache.Count - 1) / PageSize); if (_currentScanPage < maxP) { _currentScanPage++; RenderMonitorPage(); } };
         pPage.Controls.AddRange(new Control[] { _btnMonPrev, _lblMonPage, _btnMonNext });
 
         // Tabela główna
-        _gridMon = CreateStyledGrid();
+        _gridMon = UiTheme.CreateModernGrid();
         _gridMon.MultiSelect = true;
+        _gridMon.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         _gridMon.Columns.AddRange(new DataGridViewColumn[]
         {
-            new DataGridViewTextBoxColumn { Name = "State", HeaderText = "Stan Integralności", Width = 145 },
-            new DataGridViewTextBoxColumn { Name = "RelPath", HeaderText = "Folder względny", Width = 260 },
-            new DataGridViewTextBoxColumn { Name = "Filename", HeaderText = "Nazwa pliku", Width = 270 },
-            new DataGridViewTextBoxColumn { Name = "SizeKb", HeaderText = "Rozmiar [KB]", Width = 105, DefaultCellStyle = new DataGridViewCellStyle { Alignment = DataGridViewContentAlignment.MiddleRight } },
-            new DataGridViewTextBoxColumn { Name = "MtimeStr", HeaderText = "Data modyfikacji (Dysk)", Width = 155 },
-            new DataGridViewTextBoxColumn { Name = "BaselineDate", HeaderText = "Data Linii Bazowej", Width = 155 },
-            new DataGridViewTextBoxColumn { Name = "Auditor", HeaderText = "Zatwierdził", Width = 130 }
+            new DataGridViewTextBoxColumn { Name = "State", HeaderText = "Stan Integralności", FillWeight = 13 },
+            new DataGridViewTextBoxColumn { Name = "RelPath", HeaderText = "Folder względny", FillWeight = 24 },
+            new DataGridViewTextBoxColumn { Name = "Filename", HeaderText = "Nazwa pliku", FillWeight = 25 },
+            new DataGridViewTextBoxColumn { Name = "SizeKb", HeaderText = "Rozmiar [KB]", FillWeight = 10, DefaultCellStyle = new DataGridViewCellStyle { Alignment = DataGridViewContentAlignment.MiddleRight } },
+            new DataGridViewTextBoxColumn { Name = "MtimeStr", HeaderText = "Data modyfikacji (Dysk)", FillWeight = 14 },
+            new DataGridViewTextBoxColumn { Name = "BaselineDate", HeaderText = "Data Linii Bazowej", FillWeight = 14 },
+            new DataGridViewTextBoxColumn { Name = "Auditor", HeaderText = "Zatwierdził", FillWeight = 12 }
         });
+        _gridMon.CellDoubleClick += (s, e) => { if (e.RowIndex >= 0) MonOpenFile(); };
         _gridMon.CellFormatting += (s, e) =>
         {
             if (e.RowIndex >= 0 && _gridMon.Rows[e.RowIndex].Tag is ScanResultItem item)
             {
-                e.CellStyle!.ForeColor = item.State switch
+                if (e.ColumnIndex == 0)
                 {
-                    "ZGODNY" => Color.FromArgb(16, 124, 65),
-                    "NOWY" => Color.FromArgb(0, 120, 212),
-                    "ZMIENIONY" => Color.FromArgb(217, 119, 6),
-                    "USUNIĘTY" => Color.FromArgb(209, 52, 56),
-                    _ => Color.Black
-                };
-                if (item.State is "NOWY" or "ZMIENIONY")
-                    e.CellStyle.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
+                    e.CellStyle!.ForeColor = item.State switch
+                    {
+                        "ZGODNY" => UiTheme.SuccessGreen,
+                        "NOWY" => UiTheme.PrimaryBlue,
+                        "ZMIENIONY" => UiTheme.WarningAmber,
+                        "USUNIĘTY" => UiTheme.DangerRed,
+                        _ => UiTheme.TextPrimary
+                    };
+                    e.CellStyle.Font = UiTheme.FontBase(9f, FontStyle.Bold);
+                }
             }
         };
 
-        container.Controls.Add(_gridMon);
-        container.Controls.Add(pFlt);
-        container.Controls.Add(pTop);
-        container.Controls.Add(pPage);
-        container.Controls.Add(pAct);
-        tab.Controls.Add(container);
+        card.Controls.Add(_gridMon);
+        card.Controls.Add(pFlt);
+        card.Controls.Add(pTop);
+        card.Controls.Add(pPage);
+        card.Controls.Add(pAct);
+        page.Controls.Add(card);
     }
 
     private async Task RunRepositoryAuditScanAsync(bool forceSha256)
@@ -570,12 +773,12 @@ public class MainForm : Form
         _btnScanDeep.Enabled = false;
         _btnCancelScan.Visible = true;
         _lblMonSummary.Text = "Wczytywanie linii bazowej...";
-        _lblMonSummary.ForeColor = Color.FromArgb(217, 119, 6);
+        _lblMonSummary.ForeColor = UiTheme.WarningAmber;
         bool mtimeOnly = _chkMtimeOnly.Checked;
 
         var progress = new Progress<int>(count =>
         {
-            _lblMonSummary.Text = $"Skanowanie w toku... zweryfikowano {count:N0} plików";
+            _lblMonSummary.Text = $"Skanowanie... zweryfikowano {count:N0} plików";
         });
 
         try
@@ -591,15 +794,9 @@ public class MainForm : Form
                 long totalBytes = 0;
                 long lastReportTicks = 0;
 
-                // Optymalna równoległość dla I/O dyskowego (bez thrashingu)
                 int workerCount = Math.Clamp(Environment.ProcessorCount / 2, 2, 6);
-                var parallelOpts = new ParallelOptions
-                {
-                    MaxDegreeOfParallelism = workerCount,
-                    CancellationToken = ct
-                };
+                var parallelOpts = new ParallelOptions { MaxDegreeOfParallelism = workerCount, CancellationToken = ct };
 
-                // Strumieniowa enumeracja bez .ToList() i bufor wielokrotnego użytku dla każdego wątku
                 Parallel.ForEach(
                     EnumerateRepoFilesFast(repo.RootPath),
                     parallelOpts,
@@ -628,18 +825,11 @@ public class MainForm : Form
                                 string fileState;
 
                                 if (!needsHash && !mtimeOnly)
-                                {
                                     fileState = "ZGODNY";
-                                }
                                 else if (mtimeOnly && mtimeChanged && currSize == bRow.FileSize)
-                                {
                                     fileState = "ZMIENIONY";
-                                }
                                 else
-                                {
-                                    string currHash = CalculateSha256Pooled(fPath, buffer);
-                                    fileState = currHash != bRow.FileHash ? "ZMIENIONY" : "ZGODNY";
-                                }
+                                    fileState = CalculateSha256Pooled(fPath, buffer) != bRow.FileHash ? "ZMIENIONY" : "ZGODNY";
 
                                 if (fileState == "ZGODNY")
                                 {
@@ -708,7 +898,6 @@ public class MainForm : Form
                     buffer => ArrayPool<byte>.Shared.Return(buffer)
                 );
 
-                // Pliki usunięte z dysku
                 foreach (var kvp in baselineMap)
                 {
                     ct.ThrowIfCancellationRequested();
@@ -761,15 +950,15 @@ public class MainForm : Form
 
             _scanResultsCache = results;
             int disc = newC + modC + delC;
-            _lblMonSummary.Text = $"Zgodne: {okC:N0}  |  Nowe: {newC:N0}  |  Zmienione: {modC:N0}  |  Usunięte: {delC:N0}";
-            _lblMonSummary.ForeColor = disc == 0 ? Color.FromArgb(16, 124, 65) : Color.FromArgb(217, 119, 6);
+            _lblMonSummary.Text = $"✔ Zgodne: {okC:N0}   |   Nowe: {newC:N0}   |   Zmienione: {modC:N0}   |   Usunięte: {delC:N0}";
+            _lblMonSummary.ForeColor = disc == 0 ? UiTheme.SuccessGreen : UiTheme.WarningAmber;
             ApplyMonitorFilters(true);
             RefreshRepositoriesList();
         }
         catch (OperationCanceledException)
         {
-            _lblMonSummary.Text = "Skanowanie zostało przerwane przez operatora.";
-            _lblMonSummary.ForeColor = Color.DimGray;
+            _lblMonSummary.Text = "Skanowanie przerwane.";
+            _lblMonSummary.ForeColor = UiTheme.TextSecondary;
         }
         finally
         {
@@ -861,7 +1050,7 @@ public class MainForm : Form
     private void MonLocateInExplorer()
     {
         if (_gridMon.CurrentRow?.Tag is not ScanResultItem item) return;
-        _tabs.SelectedIndex = 2;
+        SelectPage(2);
         _cmbExpRepo.SelectedItem = item.RepoCode;
         OnExplorerRepoSelected(item.RepoCode);
         string? targetDir = Path.GetDirectoryName(item.AbsPath);
@@ -976,25 +1165,35 @@ public class MainForm : Form
     // =========================================================================
     // ZAKŁADKA 2: EKSPLORATOR REPOZYTORIUM
     // =========================================================================
-    private void BuildExplorerTab(TabPage tab)
+    private void BuildExplorerTab(Panel page)
     {
-        var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 38, Padding = new Padding(8, 4, 8, 0) };
-        top.Controls.Add(new Label { Text = "Repozytorium:", AutoSize = true, Margin = new Padding(0, 6, 5, 0), Font = new Font("Segoe UI", 9, FontStyle.Bold) });
-        _cmbExpRepo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 190 };
+        var card = UiTheme.CreateCardPanel(new Padding(16));
+        card.Dock = DockStyle.Fill;
+
+        var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 42 };
+        top.Controls.Add(new Label { Text = "Repozytorium:", AutoSize = true, Margin = new Padding(0, 8, 6, 0), Font = UiTheme.FontBase(9.5f, FontStyle.Bold) });
+        _cmbExpRepo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 200, Margin = new Padding(0, 4, 10, 0) };
         _cmbExpRepo.SelectedIndexChanged += (s, e) => { if (!_isSyncingCombos) OnExplorerRepoSelected(_cmbExpRepo.Text); };
         top.Controls.Add(_cmbExpRepo);
 
-        var btnRef = new Button { Text = "🔄 Odśwież drzewo", Width = 140, Height = 27 };
+        var btnRef = UiTheme.CreateSecondaryButton("🔄 Odśwież strukturę", height: 32);
+        btnRef.Margin = new Padding(0, 2, 0, 0);
         btnRef.Click += (s, e) => OnExplorerRepoSelected(_cmbExpRepo.Text);
         top.Controls.Add(btnRef);
 
-        var split = new SplitContainer { Dock = DockStyle.Fill, SplitterDistance = 340, Padding = new Padding(8) };
-        _treeExpFolders = new TreeView { Dock = DockStyle.Fill };
+        var split = new SplitContainer { Dock = DockStyle.Fill, SplitterDistance = 350, Padding = new Padding(0, 8, 0, 0) };
+        _treeExpFolders = new TreeView
+        {
+            Dock = DockStyle.Fill,
+            BorderStyle = BorderStyle.FixedSingle,
+            Font = UiTheme.FontBase(9.5f),
+            ItemHeight = 26
+        };
         _treeExpFolders.AfterSelect += (s, e) => OnExplorerFolderSelected(e.Node);
         split.Panel1.Controls.Add(_treeExpFolders);
 
-        var bot = new Panel { Dock = DockStyle.Bottom, Height = 38 };
-        var btnOpen = new Button { Text = "Otwórz plik", Width = 120, Height = 28, Location = new Point(0, 5) };
+        var bot = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 44, Padding = new Padding(0, 8, 0, 0) };
+        var btnOpen = UiTheme.CreatePrimaryButton("Otwórz zaznaczony plik", UiTheme.PrimaryBlue, UiTheme.PrimaryBlueHover, height: 32);
         btnOpen.Click += (s, e) =>
         {
             if (_gridExpFiles.CurrentRow?.Tag is string p && File.Exists(p))
@@ -1002,36 +1201,44 @@ public class MainForm : Form
         };
         bot.Controls.Add(btnOpen);
 
-        _gridExpFiles = CreateStyledGrid();
+        _gridExpFiles = UiTheme.CreateModernGrid();
+        _gridExpFiles.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         _gridExpFiles.Columns.AddRange(new DataGridViewColumn[]
         {
-            new DataGridViewTextBoxColumn { HeaderText = "Nazwa pliku", Width = 300 },
-            new DataGridViewTextBoxColumn { HeaderText = "Stan", Width = 115 },
-            new DataGridViewTextBoxColumn { HeaderText = "Rozmiar [KB]", Width = 95, DefaultCellStyle = new DataGridViewCellStyle { Alignment = DataGridViewContentAlignment.MiddleRight } },
-            new DataGridViewTextBoxColumn { HeaderText = "Data na dysku", Width = 150 },
-            new DataGridViewTextBoxColumn { HeaderText = "Data Baseline", Width = 150 }
+            new DataGridViewTextBoxColumn { HeaderText = "Nazwa pliku", FillWeight = 36 },
+            new DataGridViewTextBoxColumn { HeaderText = "Stan", FillWeight = 14 },
+            new DataGridViewTextBoxColumn { HeaderText = "Rozmiar [KB]", FillWeight = 12, DefaultCellStyle = new DataGridViewCellStyle { Alignment = DataGridViewContentAlignment.MiddleRight } },
+            new DataGridViewTextBoxColumn { HeaderText = "Data na dysku", FillWeight = 19 },
+            new DataGridViewTextBoxColumn { HeaderText = "Data Baseline", FillWeight = 19 }
         });
+        _gridExpFiles.CellDoubleClick += (s, e) =>
+        {
+            if (e.RowIndex >= 0 && _gridExpFiles.Rows[e.RowIndex].Tag is string p && File.Exists(p))
+                Process.Start(new ProcessStartInfo(p) { UseShellExecute = true });
+        };
         _gridExpFiles.CellFormatting += (s, e) =>
         {
-            if (e.RowIndex >= 0)
+            if (e.RowIndex >= 0 && e.ColumnIndex == 1)
             {
                 string st = _gridExpFiles.Rows[e.RowIndex].Cells[1].Value?.ToString() ?? "";
                 e.CellStyle!.ForeColor = st switch
                 {
-                    "ZGODNY" => Color.FromArgb(16, 124, 65),
-                    "NOWY" => Color.FromArgb(0, 120, 212),
-                    "ZMIENIONY" => Color.FromArgb(217, 119, 6),
-                    "USUNIĘTY" => Color.FromArgb(209, 52, 56),
-                    _ => Color.Black
+                    "ZGODNY" => UiTheme.SuccessGreen,
+                    "NOWY" => UiTheme.PrimaryBlue,
+                    "ZMIENIONY" => UiTheme.WarningAmber,
+                    "USUNIĘTY" => UiTheme.DangerRed,
+                    _ => UiTheme.TextPrimary
                 };
+                e.CellStyle.Font = UiTheme.FontBase(9f, FontStyle.Bold);
             }
         };
 
         split.Panel2.Controls.Add(_gridExpFiles);
         split.Panel2.Controls.Add(bot);
 
-        tab.Controls.Add(split);
-        tab.Controls.Add(top);
+        card.Controls.Add(split);
+        card.Controls.Add(top);
+        page.Controls.Add(card);
     }
 
     private void RefreshExplorerRepos()
@@ -1177,65 +1384,77 @@ public class MainForm : Form
     // =========================================================================
     // ZAKŁADKA 3: DASHBOARD (KPI + WYKRES + MIGAWKI)
     // =========================================================================
-    private void BuildDashboardTab(TabPage tab)
+    private void BuildDashboardTab(Panel page)
     {
-        var container = new Panel { Dock = DockStyle.Fill, Padding = new Padding(12) };
-
-        var top = new Panel { Dock = DockStyle.Top, Height = 38 };
-        top.Controls.Add(new Label { Text = "📈 Dashboard Integralności Repozytoriów", Font = new Font("Segoe UI", 12, FontStyle.Bold), Location = new Point(0, 6), AutoSize = true });
-        top.Controls.Add(new Label { Text = "Zakres:", Font = new Font("Segoe UI", 9, FontStyle.Bold), Location = new Point(360, 9), AutoSize = true });
-        _cmbDashScope = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Location = new Point(415, 5), Width = 180 };
+        var top = new Panel { Dock = DockStyle.Top, Height = 44 };
+        var topFlow = new FlowLayoutPanel { Dock = DockStyle.Left, AutoSize = true, WrapContents = false };
+        topFlow.Controls.Add(new Label { Text = "Zakres analizy:", Font = UiTheme.FontBase(9.5f, FontStyle.Bold), AutoSize = true, Margin = new Padding(0, 8, 8, 0) });
+        _cmbDashScope = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 200, Margin = new Padding(0, 4, 0, 0) };
         _cmbDashScope.SelectedIndexChanged += (s, e) => { if (!_isSyncingCombos) RefreshDashboardTab(); };
-        top.Controls.Add(_cmbDashScope);
+        topFlow.Controls.Add(_cmbDashScope);
 
-        var btnCsv = new Button { Text = "Eksportuj historię CSV", Width = 160, Height = 28, Dock = DockStyle.Right };
+        var btnCsv = UiTheme.CreateSecondaryButton("📄 Eksportuj historię CSV", height: 32);
+        btnCsv.Dock = DockStyle.Right;
         btnCsv.Click += (s, e) => ExportDashboardCsv();
+
+        top.Controls.Add(topFlow);
         top.Controls.Add(btnCsv);
 
-        var kpiTable = new TableLayoutPanel { Dock = DockStyle.Top, Height = 92, ColumnCount = 5, RowCount = 1, Padding = new Padding(0, 6, 0, 6) };
+        // Karty KPI z lewym paskiem akcentu
+        var kpiTable = new TableLayoutPanel { Dock = DockStyle.Top, Height = 104, ColumnCount = 5, RowCount = 1, Padding = new Padding(0, 4, 0, 8) };
         for (int i = 0; i < 5; i++) kpiTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 20f));
 
-        (_kpiTotV, _kpiTotS) = AddKpiCard(kpiTable, 0, "PLIKI POD NADZOREM", Color.FromArgb(31, 83, 141));
-        (_kpiIntV, _kpiIntS) = AddKpiCard(kpiTable, 1, "WSKAŹNIK SPÓJNOŚCI", Color.FromArgb(16, 124, 65));
-        (_kpiModV, _kpiModS) = AddKpiCard(kpiTable, 2, "ZMODYFIKOWANE", Color.FromArgb(217, 119, 6));
-        (_kpiNewV, _kpiNewS) = AddKpiCard(kpiTable, 3, "NOWE / NIEZATWIERDZONE", Color.FromArgb(0, 120, 212));
-        (_kpiDelV, _kpiDelS) = AddKpiCard(kpiTable, 4, "USUNIĘTE Z DYSKU", Color.FromArgb(209, 52, 56));
+        kpiTable.Controls.Add(UiTheme.CreateKpiCard("PLIKI POD NADZOREM", UiTheme.PrimaryBlue, out _kpiTotV, out _kpiTotS), 0, 0);
+        kpiTable.Controls.Add(UiTheme.CreateKpiCard("WSKAŹNIK SPÓJNOŚCI", UiTheme.SuccessGreen, out _kpiIntV, out _kpiIntS), 1, 0);
+        kpiTable.Controls.Add(UiTheme.CreateKpiCard("ZMODYFIKOWANE", UiTheme.WarningAmber, out _kpiModV, out _kpiModS), 2, 0);
+        kpiTable.Controls.Add(UiTheme.CreateKpiCard("NOWE / NIEZATWIERDZONE", Color.FromArgb(2, 132, 199), out _kpiNewV, out _kpiNewS), 3, 0);
+        kpiTable.Controls.Add(UiTheme.CreateKpiCard("USUNIĘTE Z DYSKU", UiTheme.DangerRed, out _kpiDelV, out _kpiDelS), 4, 0);
 
-        _chartPanel = new Panel { Dock = DockStyle.Top, Height = 195, BackColor = Color.FromArgb(248, 250, 252), BorderStyle = BorderStyle.FixedSingle };
+        // Karta wykresu trendu
+        var chartCard = UiTheme.CreateCardPanel(new Padding(12));
+        chartCard.Dock = DockStyle.Top;
+        chartCard.Height = 215;
+        chartCard.Margin = new Padding(0, 0, 0, 12);
+
+        var chartHdr = new Panel { Dock = DockStyle.Top, Height = 24 };
+        chartHdr.Controls.Add(new Label { Text = "Trend liczby plików oraz rozbieżności (ostatnie 20 kontroli)", Font = UiTheme.FontBase(9.5f, FontStyle.Bold), AutoSize = true, Location = new Point(0, 2) });
+        chartHdr.Controls.Add(new Label { Text = "● Pliki ogółem    ● Rozbieżności", Font = UiTheme.FontBase(8.5f), ForeColor = UiTheme.TextSecondary, AutoSize = true, Dock = DockStyle.Right });
+
+        _chartPanel = new Panel { Dock = DockStyle.Fill, BackColor = Color.White };
         _chartPanel.Paint += (s, e) => DrawTrendChart(e.Graphics, _chartPanel.ClientRectangle);
         _chartPanel.Resize += (s, e) => _chartPanel.Invalidate();
 
-        _gridSnaps = CreateStyledGrid();
+        chartCard.Controls.Add(_chartPanel);
+        chartCard.Controls.Add(chartHdr);
+
+        // Karta dziennika migawek
+        var gridCard = UiTheme.CreateCardPanel(new Padding(14));
+        gridCard.Dock = DockStyle.Fill;
+
+        _gridSnaps = UiTheme.CreateModernGrid();
+        _gridSnaps.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         _gridSnaps.Columns.AddRange(new DataGridViewColumn[]
         {
-            new DataGridViewTextBoxColumn { HeaderText = "Data i godzina", Width = 145 },
-            new DataGridViewTextBoxColumn { HeaderText = "Audytor", Width = 125 },
-            new DataGridViewTextBoxColumn { HeaderText = "Repozytorium", Width = 120 },
-            new DataGridViewTextBoxColumn { HeaderText = "Pliki", Width = 80 },
-            new DataGridViewTextBoxColumn { HeaderText = "Przyrost", Width = 80 },
-            new DataGridViewTextBoxColumn { HeaderText = "Zgodne", Width = 80 },
-            new DataGridViewTextBoxColumn { HeaderText = "Nowe", Width = 75 },
-            new DataGridViewTextBoxColumn { HeaderText = "Zmienione", Width = 85 },
-            new DataGridViewTextBoxColumn { HeaderText = "Usunięte", Width = 80 },
-            new DataGridViewTextBoxColumn { HeaderText = "Rozmiar [MB]", Width = 100 }
+            new DataGridViewTextBoxColumn { HeaderText = "Data i godzina", FillWeight = 16 },
+            new DataGridViewTextBoxColumn { HeaderText = "Audytor", FillWeight = 14 },
+            new DataGridViewTextBoxColumn { HeaderText = "Repozytorium", FillWeight = 13 },
+            new DataGridViewTextBoxColumn { HeaderText = "Pliki", FillWeight = 8 },
+            new DataGridViewTextBoxColumn { HeaderText = "Przyrost", FillWeight = 8 },
+            new DataGridViewTextBoxColumn { HeaderText = "Zgodne", FillWeight = 8 },
+            new DataGridViewTextBoxColumn { HeaderText = "Nowe", FillWeight = 8 },
+            new DataGridViewTextBoxColumn { HeaderText = "Zmienione", FillWeight = 9 },
+            new DataGridViewTextBoxColumn { HeaderText = "Usunięte", FillWeight = 8 },
+            new DataGridViewTextBoxColumn { HeaderText = "Rozmiar [MB]", FillWeight = 10 }
         });
+        gridCard.Controls.Add(_gridSnaps);
 
-        container.Controls.Add(_gridSnaps);
-        container.Controls.Add(_chartPanel);
-        container.Controls.Add(kpiTable);
-        container.Controls.Add(top);
-        tab.Controls.Add(container);
-    }
+        var spacer = new Panel { Dock = DockStyle.Top, Height = 12 };
 
-    private static (Label Val, Label Sub) AddKpiCard(TableLayoutPanel parent, int col, string title, Color accent)
-    {
-        var pnl = new Panel { Dock = DockStyle.Fill, BackColor = Color.FromArgb(241, 245, 249), Margin = new Padding(4), Padding = new Padding(10, 6, 10, 6) };
-        var lblT = new Label { Text = title, Font = new Font("Segoe UI", 8, FontStyle.Bold), ForeColor = Color.DimGray, Dock = DockStyle.Top, Height = 18 };
-        var lblV = new Label { Text = "-", Font = new Font("Segoe UI", 16, FontStyle.Bold), ForeColor = accent, Dock = DockStyle.Top, Height = 30 };
-        var lblS = new Label { Text = "-", Font = new Font("Segoe UI", 8.5f), ForeColor = Color.Gray, Dock = DockStyle.Top, Height = 18 };
-        pnl.Controls.AddRange(new Control[] { lblS, lblV, lblT });
-        parent.Controls.Add(pnl, col, 0);
-        return (lblV, lblS);
+        page.Controls.Add(gridCard);
+        page.Controls.Add(spacer);
+        page.Controls.Add(chartCard);
+        page.Controls.Add(kpiTable);
+        page.Controls.Add(top);
     }
 
     private void RefreshDashboardTab()
@@ -1300,16 +1519,16 @@ public class MainForm : Form
     {
         g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
         var snaps = _dashSnapshotsCache.TakeLast(20).ToList();
-        using var font = new Font("Segoe UI", 8f);
-        using var boldFont = new Font("Segoe UI", 8f, FontStyle.Bold);
+        using var font = UiTheme.FontBase(8f);
+        using var boldFont = UiTheme.FontBase(8f, FontStyle.Bold);
 
         if (snaps.Count == 0)
         {
-            TextRenderer.DrawText(g, "Brak danych pomiarowych – uruchom skanowanie w zakładce Monitor Zmian", font, rect, Color.Gray, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+            TextRenderer.DrawText(g, "Brak danych pomiarowych – uruchom skanowanie w zakładce Monitor Zmian", font, rect, UiTheme.TextSecondary, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
             return;
         }
 
-        int padL = 45, padR = 25, padT = 22, padB = 26;
+        int padL = 48, padR = 25, padT = 18, padB = 24;
         int pw = Math.Max(10, rect.Width - padL - padR);
         int ph = Math.Max(10, rect.Height - padT - padB);
 
@@ -1317,13 +1536,13 @@ public class MainForm : Form
         var diffs = snaps.Select(s => s.NewCount + s.ModifiedCount + s.DeletedCount).ToList();
         int maxV = Math.Max(Math.Max(totals.Max(), diffs.Max()), 5);
 
-        using var gridPen = new Pen(Color.FromArgb(226, 232, 240)) { DashStyle = System.Drawing.Drawing2D.DashStyle.Dot };
+        using var gridPen = new Pen(UiTheme.CardBorder) { DashStyle = System.Drawing.Drawing2D.DashStyle.Dot };
         for (int i = 0; i < 4; i++)
         {
             float y = padT + (ph * i / 3f);
             g.DrawLine(gridPen, padL, y, rect.Width - padR, y);
             int labelVal = (int)Math.Round(maxV * (1.0 - i / 3.0));
-            g.DrawString(labelVal.ToString(), font, Brushes.SlateGray, 8, y - 7);
+            g.DrawString(labelVal.ToString(), font, Brushes.SlateGray, 6, y - 7);
         }
 
         int n = snaps.Count;
@@ -1338,24 +1557,24 @@ public class MainForm : Form
             if (n <= 8 || i == 0 || i == n - 1 || i % 2 == 0)
             {
                 string tsShort = snaps[i].Timestamp.Length >= 16 ? snaps[i].Timestamp[5..16] : snaps[i].Timestamp;
-                g.DrawString(tsShort, font, Brushes.SlateGray, x - 26, rect.Height - 18);
+                g.DrawString(tsShort, font, Brushes.SlateGray, x - 26, rect.Height - 17);
             }
         }
 
         if (n > 1)
         {
-            using var penTot = new Pen(Color.FromArgb(59, 130, 246), 2.5f);
-            using var penDif = new Pen(Color.FromArgb(245, 158, 11), 2f);
+            using var penTot = new Pen(UiTheme.PrimaryBlue, 2.5f);
+            using var penDif = new Pen(UiTheme.WarningAmber, 2f);
             g.DrawLines(penTot, ptsTot);
             g.DrawLines(penDif, ptsDif);
         }
 
         for (int i = 0; i < n; i++)
         {
-            g.FillEllipse(Brushes.RoyalBlue, ptsTot[i].X - 3.5f, ptsTot[i].Y - 3.5f, 7, 7);
-            g.DrawString(totals[i].ToString(), boldFont, Brushes.DarkBlue, ptsTot[i].X - 8, ptsTot[i].Y - 16);
+            g.FillEllipse(Brushes.RoyalBlue, ptsTot[i].X - 4f, ptsTot[i].Y - 4f, 8, 8);
+            g.DrawString(totals[i].ToString(), boldFont, Brushes.DarkBlue, ptsTot[i].X - 8, ptsTot[i].Y - 17);
             if (diffs[i] > 0)
-                g.FillEllipse(Brushes.DarkOrange, ptsDif[i].X - 3f, ptsDif[i].Y - 3f, 6, 6);
+                g.FillEllipse(Brushes.DarkOrange, ptsDif[i].X - 3.5f, ptsDif[i].Y - 3.5f, 7, 7);
         }
     }
 
@@ -1375,37 +1594,42 @@ public class MainForm : Form
     // =========================================================================
     // ZAKŁADKA 4: HISTORIA I AUDYT
     // =========================================================================
-    private void BuildAuditTab(TabPage tab)
+    private void BuildAuditTab(Panel page)
     {
-        var container = new Panel { Dock = DockStyle.Fill, Padding = new Padding(12) };
-        var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 40 };
-        top.Controls.Add(new Label { Text = "Dziennik Zdarzeń Audytowych:", Font = new Font("Segoe UI", 11, FontStyle.Bold), AutoSize = true, Margin = new Padding(0, 5, 10, 0) });
+        var card = UiTheme.CreateCardPanel(new Padding(16));
+        card.Dock = DockStyle.Fill;
 
-        _cmbAuditRepo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 210 };
+        var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 44 };
+        top.Controls.Add(new Label { Text = "Dziennik Zdarzeń Audytowych:", Font = UiTheme.FontBase(10f, FontStyle.Bold), AutoSize = true, Margin = new Padding(0, 8, 10, 0) });
+
+        _cmbAuditRepo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 220, Margin = new Padding(0, 4, 10, 0) };
         _cmbAuditRepo.SelectedIndexChanged += (s, e) => { if (!_isSyncingCombos) RefreshAuditTab(); };
         top.Controls.Add(_cmbAuditRepo);
 
-        var btnRef = new Button { Text = "Odśwież", Width = 95, Height = 28 };
+        var btnRef = UiTheme.CreateSecondaryButton("🔄 Odśwież", height: 32);
+        btnRef.Margin = new Padding(0, 2, 8, 0);
         btnRef.Click += (s, e) => RefreshAuditTab();
         top.Controls.Add(btnRef);
 
-        var btnPdf = new Button { Text = "Generuj raport PDF", BackColor = Color.FromArgb(31, 83, 141), ForeColor = Color.White, FlatStyle = FlatStyle.Flat, Width = 155, Height = 28 };
+        var btnPdf = UiTheme.CreatePrimaryButton("📑 Generuj raport PDF", UiTheme.PrimaryBlue, UiTheme.PrimaryBlueHover, height: 32);
+        btnPdf.Margin = new Padding(0, 2, 0, 0);
         btnPdf.Click += (s, e) => ExportRepoPdfReport();
         top.Controls.Add(btnPdf);
 
-        _gridAudit = CreateStyledGrid();
+        _gridAudit = UiTheme.CreateModernGrid();
+        _gridAudit.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         _gridAudit.Columns.AddRange(new DataGridViewColumn[]
         {
-            new DataGridViewTextBoxColumn { HeaderText = "Data i Czas", Width = 145 },
-            new DataGridViewTextBoxColumn { HeaderText = "Audytor", Width = 120 },
-            new DataGridViewTextBoxColumn { HeaderText = "Zdarzenie", Width = 185 },
-            new DataGridViewTextBoxColumn { HeaderText = "Obiekt / Ścieżka", Width = 240 },
-            new DataGridViewTextBoxColumn { HeaderText = "Szczegóły i Uzasadnienie", Width = 520 }
+            new DataGridViewTextBoxColumn { HeaderText = "Data i Czas", FillWeight = 14 },
+            new DataGridViewTextBoxColumn { HeaderText = "Audytor", FillWeight = 12 },
+            new DataGridViewTextBoxColumn { HeaderText = "Zdarzenie", FillWeight = 18 },
+            new DataGridViewTextBoxColumn { HeaderText = "Obiekt / Ścieżka", FillWeight = 22 },
+            new DataGridViewTextBoxColumn { HeaderText = "Szczegóły i Uzasadnienie", FillWeight = 34 }
         });
 
-        container.Controls.Add(_gridAudit);
-        container.Controls.Add(top);
-        tab.Controls.Add(container);
+        card.Controls.Add(_gridAudit);
+        card.Controls.Add(top);
+        page.Controls.Add(card);
     }
 
     private void RefreshAuditTab()
@@ -1474,7 +1698,7 @@ public class MainForm : Form
     }
 
     // =========================================================================
-    // NARZĘDZIA POMOCNICZE (SHA-256 POOLED, AUDIT TRAIL, SZYBKIE TRAWERSOWANIE)
+    // NARZĘDZIA POMOCNICZE
     // =========================================================================
     private void LogAuditTrail(string repoRoot, string action, string target, string details)
     {
@@ -1576,37 +1800,34 @@ public class MainForm : Form
         return Regex.Replace(text, @"[\s_]+", "-").ToUpperInvariant();
     }
 
-    private static DataGridView CreateStyledGrid()
-    {
-        var dgv = new DataGridView
-        {
-            Dock = DockStyle.Fill,
-            AllowUserToAddRows = false,
-            AllowUserToDeleteRows = false,
-            ReadOnly = true,
-            SelectionMode = DataGridViewSelectionMode.FullRowSelect,
-            RowHeadersVisible = false,
-            BackgroundColor = Color.White,
-            BorderStyle = BorderStyle.FixedSingle,
-            AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.None,
-            AllowUserToResizeRows = false
-        };
-        typeof(DataGridView).InvokeMember(
-            "DoubleBuffered",
-            BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.SetProperty,
-            null,
-            dgv,
-            new object[] { true });
-        return dgv;
-    }
-
     private string? PromptAuditReason(int count)
     {
-        using var dlg = new Form { Text = "Uzasadnienie zmiany (Audit Trail)", Size = new Size(460, 200), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false };
-        var lbl = new Label { Text = $"Zamierzasz zatwierdzić {count:N0} zmian(y) do nowej Linii Bazowej.\nPodaj powód / komentarz audytowy:", Location = new Point(15, 15), Size = new Size(415, 38) };
-        var txt = new TextBox { PlaceholderText = "np. Aktualizacja po przeglądzie", Location = new Point(15, 60), Size = new Size(415, 26) };
-        var btnOk = new Button { Text = "Zatwierdź", DialogResult = DialogResult.OK, Location = new Point(250, 105), Width = 85, Height = 30 };
-        var btnCancel = new Button { Text = "Anuluj", DialogResult = DialogResult.Cancel, Location = new Point(345, 105), Width = 85, Height = 30 };
+        using var dlg = new Form
+        {
+            Text = "Uzasadnienie zmiany (Audit Trail)",
+            Size = new Size(480, 215),
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            StartPosition = FormStartPosition.CenterParent,
+            MaximizeBox = false,
+            MinimizeBox = false,
+            BackColor = Color.White,
+            Font = UiTheme.FontBase()
+        };
+        var lbl = new Label
+        {
+            Text = $"Zamierzasz zatwierdzić {count:N0} zmian(y) do nowej Linii Bazowej.\nPodaj powód / komentarz audytowy:",
+            Location = new Point(18, 16),
+            Size = new Size(430, 40)
+        };
+        var txt = new TextBox { PlaceholderText = "np. Aktualizacja po przeglądzie", Location = new Point(18, 64), Size = new Size(430, 28) };
+        var btnOk = UiTheme.CreatePrimaryButton("Zatwierdź", UiTheme.SuccessGreen, UiTheme.SuccessGreenHover, width: 105, height: 32);
+        btnOk.Location = new Point(242, 112);
+        btnOk.DialogResult = DialogResult.OK;
+
+        var btnCancel = UiTheme.CreateSecondaryButton("Anuluj", width: 95, height: 32);
+        btnCancel.Location = new Point(353, 112);
+        btnCancel.DialogResult = DialogResult.Cancel;
+
         dlg.AcceptButton = btnOk;
         dlg.CancelButton = btnCancel;
         dlg.Controls.AddRange(new Control[] { lbl, txt, btnOk, btnCancel });
