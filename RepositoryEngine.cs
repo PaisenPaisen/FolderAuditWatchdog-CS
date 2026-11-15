@@ -93,8 +93,8 @@ public class RepositoryEngine
         string owner,
         string currentUser,
         EngineResourceProfile profile,
-        IProgress<ScanProgressReport>? progress,
-        CancellationToken ct)
+        IProgress<ScanProgressReport>? progress = null,
+        CancellationToken ct = default)
     {
         string nowStr = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
         long startTicks = Environment.TickCount64;
