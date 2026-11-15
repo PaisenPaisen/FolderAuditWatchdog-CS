@@ -7,13 +7,36 @@ internal static class Program
     {
         ApplicationConfiguration.Initialize();
 
+        // Przechwytywanie nieobsłużonych wyjątków w wątku interfejsu (UI)
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (s, e) =>
+        {
+            MessageBox.Show(
+                $"Wystąpił nieoczekiwany błąd interfejsu aplikacji:\n\n{e.Exception.Message}\n\nSzczegóły techniczne:\n{e.Exception.StackTrace}",
+                "Błąd aplikacji – Folder Audit Watchdog",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error
+            );
+        };
+
+        // Przechwytywanie nieobsłużonych wyjątków z wątków w tle (np. podczas skanowania)
+        AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+        {
+            if (e.ExceptionObject is Exception ex)
+            {
+                MessageBox.Show(
+                    $"Wystąpił krytyczny błąd w tle:\n\n{ex.Message}\n\nSzczegóły techniczne:\n{ex.StackTrace}",
+                    "Błąd krytyczny – Folder Audit Watchdog",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error
+                );
+            }
+        };
+
         using var login = new SessionLoginDialog();
         if (login.ShowDialog() != DialogResult.OK || string.IsNullOrWhiteSpace(login.OperatorName))
             return;
-Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
-        Application.ThreadException += (s, e) =>
-            MessageBox.Show($"Wystąpił błąd aplikacji:\n\n{e.Exception.Message}\n\n{e.Exception.StackTrace}",
-                "Błąd", MessageBoxButtons.OK, MessageBoxIcon.Error);
+
         Application.Run(new MainForm(login.OperatorName));
     }
 }
