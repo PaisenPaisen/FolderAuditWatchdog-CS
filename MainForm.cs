@@ -381,6 +381,31 @@ public class MainForm : Form
         _txtRepoOwner = new TextBox { Text = _currentUser, Width = 355, Font = UiTheme.FontBase(10f), Margin = new Padding(0, 0, 0, 18) };
         formFlow.Controls.Add(_txtRepoOwner);
 
+        formFlow.Controls.Add(MakeFieldLabel("4. Osoba odpowiedzialna / Audytor:"));
+        _txtRepoOwner = new TextBox { Text = _currentUser, Width = 355, Font = UiTheme.FontBase(10f), Margin = new Padding(0, 0, 0, 12) };
+        formFlow.Controls.Add(_txtRepoOwner);
+
+        // ---> TUTAJ WKLEJ PUNKT 2 <---
+        formFlow.Controls.Add(MakeFieldLabel("5. Profil przepustowości I/O i pamięci RAM:"));
+        _cmbResourceProfile = new ComboBox
+        {
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Width = 355,
+            Font = UiTheme.FontBase(9.5f),
+            Margin = new Padding(0, 0, 0, 18)
+        };
+        _cmbResourceProfile.Items.AddRange(new object[]
+        {
+            "🟢 Ekonomiczny (2–4 wątki, bufor 1 MB, niski RAM)",
+            "🔵 Zrównoważony (4–8 wątków, bufor 4 MB)",
+            "🚀 Maksymalny (8–16 wątków, bufor 8 MB, pełne NVMe)"
+        });
+        _cmbResourceProfile.SelectedIndex = 1; // Domyślnie Zrównoważony
+        formFlow.Controls.Add(_cmbResourceProfile);
+        // ---> KONIEC PUNKTU 2 <---
+
+        _btnCreateRepo = UiTheme.CreatePrimaryButton("🛡️ Utwórz Linię Bazową (Baseline)", UiTheme.SuccessGreen, UiTheme.SuccessGreenHover, width: 355, height: 42);
+
         _btnCreateRepo = UiTheme.CreatePrimaryButton("🛡️ Utwórz Linię Bazową (Baseline)", UiTheme.SuccessGreen, UiTheme.SuccessGreenHover, width: 355, height: 42);
         _btnCreateRepo.Click += async (s, e) => await RegisterNewRepositoryAsync();
         formFlow.Controls.Add(_btnCreateRepo);
