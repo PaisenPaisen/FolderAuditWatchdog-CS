@@ -1,203 +1,339 @@
 using System.Buffers;
+using System.IO.Enumeration;
+using System.IO.MemoryMappedFiles;
 using System.Security.Cryptography;
 using System.Threading.Channels;
+using Microsoft.Win32.SafeHandles;
 
 namespace FolderAuditWatchdog;
 
-public record ScanProgressReport(int ProcessedFiles, long ProcessedBytes, string CurrentFile, string Phase);
+public enum ResourceProfileMode
+{
+    Eco,        // Niskie obciążenie RAM/CPU (praca w tle / sieć)
+    Balanced,   // Zrównoważony (domyślny)
+    Maximum     // Maksymalna przepustowość NVMe + większa alokacja buforów w RAM
+}
+
+public record EngineResourceProfile(
+    ResourceProfileMode Mode,
+    string DisplayName,
+    int WorkerCount,
+    int ReadBufferBytes,
+    int ChannelBatchCapacity,
+    int DbBatchSize
+)
+{
+    public static EngineResourceProfile FromMode(ResourceProfileMode mode)
+    {
+        int cores = Environment.ProcessorCount;
+        return mode switch
+        {
+            ResourceProfileMode.Eco => new EngineResourceProfile(
+                Mode: mode,
+                DisplayName: "🟢 Ekonomiczny (niskie zużycie RAM/I/O)",
+                WorkerCount: Math.Clamp(cores / 4, 2, 4),
+                ReadBufferBytes: 1 * 1024 * 1024,      // 1 MB
+                ChannelBatchCapacity: 32,              // 32 paczki x 100 plików = 3200 plików w buforze
+                DbBatchSize: 500
+            ),
+            ResourceProfileMode.Maximum => new EngineResourceProfile(
+                Mode: mode,
+                DisplayName: "🚀 Maksymalny (pełna przepustowość RAM/NVMe)",
+                WorkerCount: Math.Clamp(cores, 8, 16),
+                ReadBufferBytes: 8 * 1024 * 1024,      // 8 MB
+                ChannelBatchCapacity: 128,             // 128 paczek x 100 plików = 12 800 plików w buforze
+                DbBatchSize: 2000
+            ),
+            _ => new EngineResourceProfile(
+                Mode: ResourceProfileMode.Balanced,
+                DisplayName: "🔵 Zrównoważony (standardowy)",
+                WorkerCount: Math.Clamp(cores / 2, 4, 8),
+                ReadBufferBytes: 4 * 1024 * 1024,      // 4 MB
+                ChannelBatchCapacity: 64,              // 64 paczki x 100 plików = 6400 plików w buforze
+                DbBatchSize: 1000
+            )
+        };
+    }
+}
+
+public record ScanProgressReport(
+    int ProcessedFiles,
+    int TotalDiscoveredFiles,
+    bool DiscoveryCompleted,
+    long ProcessedBytes,
+    long TotalDiscoveredBytes,
+    double SpeedMbPerSec,
+    string CurrentFile,
+    string Phase
+);
+
+internal readonly record struct DiscoveredFile(
+    string FullPath,
+    string RelativePath,
+    string FileName,
+    long Length,
+    double LastWriteUnix
+);
 
 public class RepositoryEngine
 {
     private readonly AuditDatabaseManager _db;
-    private const int BatchSize = 2000;
+    private const int DiscoveryBatchSize = 100; // Paczki po 100 plików przekazywane do warstwy 2
+    private const long MmfThresholdBytes = 1 * 1024 * 1024; // Zero-Copy MMF dla plików >= 1 MB
 
     public RepositoryEngine(AuditDatabaseManager db)
     {
         _db = db;
     }
 
-    /// <summary>
-    /// Tworzy nową linię bazową strumieniowo (Producer -> Hash Workers -> Batch SQLite Writer),
-    /// bez ładowania listy wszystkich plików do pamięci RAM i bez blokowania UI.
-    /// </summary>
     public async Task<int> CreateBaselineStreamedAsync(
         int repoId,
         string code,
         string rootDir,
         string owner,
         string currentUser,
+        EngineResourceProfile profile,
         IProgress<ScanProgressReport>? progress,
         CancellationToken ct)
     {
         string nowStr = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+        long startTicks = Environment.TickCount64;
 
-        // Kanał 1: ścieżki plików z dysku -> workery SHA-256 (max 4096 w buforze)
-        var fileChannel = Channel.CreateBounded<string>(new BoundedChannelOptions(4096)
+        // Warstwa 1 -> Warstwa 2: kanał przenoszący paczki po 100 plików (100x mniej operacji synchronizacji)
+        var batchChannel = Channel.CreateBounded<List<DiscoveredFile>>(new BoundedChannelOptions(profile.ChannelBatchCapacity)
         {
             SingleWriter = true,
             SingleReader = false,
             FullMode = BoundedChannelFullMode.Wait
         });
 
-        // Kanał 2: gotowe rekordy -> pojedynczy zapisujący do SQLite
+        // Warstwa 2 -> Warstwa 3: kanał gotowych rekordów do zapisu w SQLite
         var recordChannel = Channel.CreateBounded<(int RepoId, string RelPath, string Filename, string Hash, long Size, double Mtime, string UpdatedAt, string UpdatedBy)>(
-            new BoundedChannelOptions(BatchSize * 2)
+            new BoundedChannelOptions(profile.DbBatchSize * 2)
             {
                 SingleWriter = false,
                 SingleReader = true,
                 FullMode = BoundedChannelFullMode.Wait
             });
 
+        int discoveredFiles = 0;
+        long discoveredBytes = 0;
+        int discoveryDone = 0;
+
         int processedCount = 0;
         long totalBytes = 0;
         long lastUiReportTicks = 0;
 
-        // 1. PRODUCER: Szybkie skanowanie struktury katalogów
+        // =====================================================================
+        // WARSTWA 1 (PRODUCER): Katalogowanie dysku w paczkach po 100 plików
+        // =====================================================================
         var producerTask = Task.Run(async () =>
         {
+            var currentBatch = new List<DiscoveredFile>(DiscoveryBatchSize);
             try
             {
-                foreach (var file in EnumerateRepoFilesFast(rootDir))
+                foreach (var item in EnumerateDiscoveredFilesFast(rootDir))
                 {
                     ct.ThrowIfCancellationRequested();
-                    await fileChannel.Writer.WriteAsync(file, ct);
+                    currentBatch.Add(item);
+                    Interlocked.Increment(ref discoveredFiles);
+                    Interlocked.Add(ref discoveredBytes, item.Length);
+
+                    if (currentBatch.Count >= DiscoveryBatchSize)
+                    {
+                        await batchChannel.Writer.WriteAsync(currentBatch, ct);
+                        currentBatch = new List<DiscoveredFile>(DiscoveryBatchSize);
+                    }
+                }
+
+                if (currentBatch.Count > 0)
+                {
+                    await batchChannel.Writer.WriteAsync(currentBatch, ct);
                 }
             }
             finally
             {
-                fileChannel.Writer.Complete();
+                Interlocked.Exchange(ref discoveryDone, 1);
+                batchChannel.Writer.Complete();
             }
         }, ct);
 
-        // 2. WORKERS: Optymalna liczba wątków dla I/O dyskowego (4-6 zamiast 32)
-        int workerCount = Math.Clamp(Environment.ProcessorCount / 2, 2, 6);
-        var workerTasks = Enumerable.Range(0, workerCount).Select(_ => Task.Run(async () =>
+        // =====================================================================
+        // WARSTWA 2 (WORKERS): Przetwarzanie paczek 100-plikowych (Zero-Copy MMF + RandomAccess)
+        // =====================================================================
+        var workerTasks = Enumerable.Range(0, profile.WorkerCount).Select(_ => Task.Run(async () =>
         {
-            byte[] buffer = ArrayPool<byte>.Shared.Rent(262144); // 256 KB bufor wielokrotnego użytku
+            byte[] smallFileBuffer = ArrayPool<byte>.Shared.Rent(profile.ReadBufferBytes);
             try
             {
-                await foreach (var fPath in fileChannel.Reader.ReadAllAsync(ct))
+                await foreach (var fileBatch in batchChannel.Reader.ReadAllAsync(ct))
                 {
-                    try
+                    foreach (var item in fileBatch)
                     {
-                        var fi = new FileInfo(fPath);
-                        if (!fi.Exists) continue;
-
-                        string rel = Path.GetRelativePath(rootDir, fPath).Replace('\\', '/');
-                        string hash = CalculateSha256Pooled(fPath, buffer);
-                        double mtime = (fi.LastWriteTimeUtc - DateTime.UnixEpoch).TotalSeconds;
-                        long len = fi.Length;
-
-                        await recordChannel.Writer.WriteAsync((repoId, rel, fi.Name, hash, len, mtime, nowStr, currentUser), ct);
-
-                        int current = Interlocked.Increment(ref processedCount);
-                        long bytes = Interlocked.Add(ref totalBytes, len);
-
-                        // Throttling raportowania do UI: odświeżaj maksymalnie co 250 ms
-                        long nowTicks = Environment.TickCount64;
-                        long prevTicks = Interlocked.Read(ref lastUiReportTicks);
-                        if (nowTicks - prevTicks >= 250 && Interlocked.CompareExchange(ref lastUiReportTicks, nowTicks, prevTicks) == prevTicks)
+                        ct.ThrowIfCancellationRequested();
+                        try
                         {
-                            progress?.Report(new ScanProgressReport(current, bytes, fi.Name, "Indeksowanie i obliczanie SHA-256..."));
+                            string hash = item.Length >= MmfThresholdBytes
+                                ? CalculateSha256MemoryMapped(item.FullPath, item.Length)
+                                : CalculateSha256RandomAccess(item.FullPath, smallFileBuffer);
+
+                            await recordChannel.Writer.WriteAsync(
+                                (repoId, item.RelativePath, item.FileName, hash, item.Length, item.LastWriteUnix, nowStr, currentUser),
+                                ct);
+
+                            int current = Interlocked.Increment(ref processedCount);
+                            long bytes = Interlocked.Add(ref totalBytes, item.Length);
+
+                            long nowTicks = Environment.TickCount64;
+                            long prevTicks = Interlocked.Read(ref lastUiReportTicks);
+                            if (nowTicks - prevTicks >= 200 && Interlocked.CompareExchange(ref lastUiReportTicks, nowTicks, prevTicks) == prevTicks)
+                            {
+                                double elapsedSec = Math.Max(0.1, (nowTicks - startTicks) / 1000.0);
+                                double speedMb = (bytes / (1024.0 * 1024.0)) / elapsedSec;
+                                progress?.Report(new ScanProgressReport(
+                                    ProcessedFiles: current,
+                                    TotalDiscoveredFiles: Volatile.Read(ref discoveredFiles),
+                                    DiscoveryCompleted: Volatile.Read(ref discoveryDone) == 1,
+                                    ProcessedBytes: bytes,
+                                    TotalDiscoveredBytes: Volatile.Read(ref discoveredBytes),
+                                    SpeedMbPerSec: speedMb,
+                                    CurrentFile: item.FileName,
+                                    Phase: $"Przetwarzanie paczek ({profile.WorkerCount} wątków I/O)"
+                                ));
+                            }
                         }
+                        catch (OperationCanceledException) { throw; }
+                        catch { /* Pominięcie pliku zablokowanego przez inny proces */ }
                     }
-                    catch (OperationCanceledException) { throw; }
-                    catch { /* Pominięcie zablokowanego pliku systemowego */ }
                 }
             }
             finally
             {
-                ArrayPool<byte>.Shared.Return(buffer);
+                ArrayPool<byte>.Shared.Return(smallFileBuffer);
             }
         }, ct)).ToArray();
 
-        // Zamknięcie kanału zapisu po zakończeniu wszystkich workerów
         var closeRecordsTask = Task.WhenAll(workerTasks).ContinueWith(
             t => recordChannel.Writer.Complete(t.Exception),
             CancellationToken.None,
             TaskContinuationOptions.ExecuteSynchronously,
             TaskScheduler.Default);
 
-        // 3. CONSUMER: Zapis paczkowy (Batch) do SQLite w trakcie skanowania
+        // =====================================================================
+        // WARSTWA 3 (CONSUMER): Paczkowy zapis do SQLite (po uzbieraniu paczki LUB co 1s)
+        // =====================================================================
         var consumerTask = Task.Run(async () =>
         {
-            var batch = new List<(int, string, string, string, long, double, string, string)>(BatchSize);
+            var dbBatch = new List<(int, string, string, string, long, double, string, string)>(profile.DbBatchSize);
+            long lastFlushTicks = Environment.TickCount64;
+
             await foreach (var rec in recordChannel.Reader.ReadAllAsync(ct))
             {
-                batch.Add(rec);
-                if (batch.Count >= BatchSize)
+                dbBatch.Add(rec);
+                long now = Environment.TickCount64;
+
+                if (dbBatch.Count >= profile.DbBatchSize || (now - lastFlushTicks >= 1000 && dbBatch.Count > 0))
                 {
-                    _db.BulkInsertBaseline(batch);
-                    batch.Clear();
+                    _db.BulkInsertBaseline(dbBatch);
+                    dbBatch.Clear();
+                    lastFlushTicks = now;
                 }
             }
-            if (batch.Count > 0)
+
+            if (dbBatch.Count > 0)
             {
-                _db.BulkInsertBaseline(batch);
-                batch.Clear();
+                _db.BulkInsertBaseline(dbBatch);
+                dbBatch.Clear();
             }
         }, ct);
 
         await Task.WhenAll(producerTask, closeRecordsTask, consumerTask);
 
-        progress?.Report(new ScanProgressReport(processedCount, totalBytes, "", "Zapisywanie migawki audytowej..."));
-        _db.AddSnapshot(currentUser, code, processedCount, processedCount, 0, 0, 0, totalBytes / (1024.0 * 1024.0));
+        double finalSec = Math.Max(0.1, (Environment.TickCount64 - startTicks) / 1000.0);
+        double finalSpeed = (totalBytes / (1024.0 * 1024.0)) / finalSec;
+        progress?.Report(new ScanProgressReport(
+            processedCount, processedCount, true, totalBytes, totalBytes, finalSpeed, "", "Zapisywanie migawki audytowej..."
+        ));
 
+        _db.AddSnapshot(currentUser, code, processedCount, processedCount, 0, 0, 0, totalBytes / (1024.0 * 1024.0));
         return processedCount;
     }
 
-    private static IEnumerable<string> EnumerateRepoFilesFast(string rootDir)
+    /// <summary>
+    /// Zero-Copy SHA-256 dla dużych plików (>= 1 MB) przy użyciu okna przesuwnego MemoryMappedFile (32 MB).
+    /// Brak kopiowania danych między pamięcią jądra Windows a buforem C#.
+    /// </summary>
+    public static string CalculateSha256MemoryMapped(string filePath, long fileLength)
     {
-        var opts = new EnumerationOptions
+        const long windowSize = 32L * 1024 * 1024; // Okno 32 MB
+        try
         {
-            IgnoreInaccessible = true,
-            AttributesToSkip = FileAttributes.ReparsePoint, // Unika zapętlenia na dowiązaniach symbolicznych
-            RecurseSubdirectories = false
-        };
+            using var mmf = MemoryMappedFile.CreateFromFile(
+                filePath,
+                FileMode.Open,
+                mapName: null,
+                capacity: 0,
+                access: MemoryMappedFileAccess.Read);
 
-        var stack = new Stack<string>();
-        stack.Push(rootDir);
+            using var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            long offset = 0;
 
-        while (stack.Count > 0)
-        {
-            string curr = stack.Pop();
-            IEnumerable<string> subDirs;
-            try { subDirs = Directory.EnumerateDirectories(curr, "*", opts); }
-            catch { continue; }
-
-            foreach (var d in subDirs)
+            while (offset < fileLength)
             {
-                string name = Path.GetFileName(d);
-                if (name is not ("._audit_meta" or "._vault_meta"))
-                    stack.Push(d);
+                long length = Math.Min(windowSize, fileLength - offset);
+                using var accessor = mmf.CreateViewAccessor(offset, length, MemoryMappedFileAccess.Read);
+                unsafe
+                {
+                    byte* ptr = null;
+                    accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
+                    try
+                    {
+                        var span = new ReadOnlySpan<byte>(ptr + accessor.PointerOffset, (int)length);
+                        sha.AppendData(span);
+                    }
+                    finally
+                    {
+                        accessor.SafeMemoryMappedViewHandle.ReleasePointer();
+                    }
+                }
+                offset += length;
             }
 
-            IEnumerable<string> files;
-            try { files = Directory.EnumerateFiles(curr, "*", opts); }
-            catch { continue; }
-
-            foreach (var f in files)
-                yield return f;
+            return Convert.ToHexString(sha.GetHashAndReset()).ToLowerInvariant()[..16];
+        }
+        catch
+        {
+            // Fallback do standardowego RandomAccess (np. dla plików na niektórych udziałach sieciowych)
+            byte[] fallbackBuf = ArrayPool<byte>.Shared.Rent(2 * 1024 * 1024);
+            try
+            {
+                return CalculateSha256RandomAccess(filePath, fallbackBuf);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(fallbackBuf);
+            }
         }
     }
 
-    private static string CalculateSha256Pooled(string filePath, byte[] buffer)
+    public static string CalculateSha256RandomAccess(string filePath, byte[] buffer)
     {
         try
         {
-            using var stream = new FileStream(
+            using SafeFileHandle handle = File.OpenHandle(
                 filePath,
                 FileMode.Open,
                 FileAccess.Read,
                 FileShare.ReadWrite,
-                bufferSize: buffer.Length,
-                options: FileOptions.SequentialScan); // Podpowiedź dla cache systemu Windows
+                FileOptions.SequentialScan);
 
             using var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            long offset = 0;
             int bytesRead;
-            while ((bytesRead = stream.Read(buffer, 0, buffer.Length)) > 0)
+            while ((bytesRead = RandomAccess.Read(handle, buffer, offset)) > 0)
             {
-                sha.AppendData(buffer, 0, bytesRead);
+                sha.AppendData(buffer.AsSpan(0, bytesRead));
+                offset += bytesRead;
             }
             return Convert.ToHexString(sha.GetHashAndReset()).ToLowerInvariant()[..16];
         }
@@ -205,5 +341,38 @@ public class RepositoryEngine
         {
             return "ERROR";
         }
+    }
+
+    private static IEnumerable<DiscoveredFile> EnumerateDiscoveredFilesFast(string rootDir)
+    {
+        var opts = new EnumerationOptions
+        {
+            IgnoreInaccessible = true,
+            AttributesToSkip = FileAttributes.ReparsePoint,
+            RecurseSubdirectories = true
+        };
+
+        var enumerable = new FileSystemEnumerable<DiscoveredFile>(
+            rootDir,
+            (ref FileSystemEntry entry) =>
+            {
+                string fullPath = entry.ToFullPath();
+                string relPath = Path.GetRelativePath(rootDir, fullPath).Replace('\\', '/');
+                double unixMtime = (entry.LastWriteTimeUtc.UtcDateTime - DateTime.UnixEpoch).TotalSeconds;
+                return new DiscoveredFile(fullPath, relPath, entry.FileName.ToString(), entry.Length, unixMtime);
+            },
+            opts)
+        {
+            ShouldIncludePredicate = (ref FileSystemEntry entry) => !entry.IsDirectory,
+            ShouldRecursePredicate = (ref FileSystemEntry entry) =>
+            {
+                ReadOnlySpan<char> name = entry.FileName;
+                return !name.Equals("._audit_meta", StringComparison.OrdinalIgnoreCase) &&
+                       !name.Equals("._vault_meta", StringComparison.OrdinalIgnoreCase);
+            }
+        };
+
+        foreach (var item in enumerable)
+            yield return item;
     }
 }
