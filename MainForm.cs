@@ -521,6 +521,18 @@ public class MainForm : Form
     }
 
     private async Task RegisterNewRepositoryAsync()
+
+    private EngineResourceProfile GetSelectedResourceProfile()
+{
+    var mode = _cmbResourceProfile?.SelectedIndex switch
+    {
+        0 => ResourceProfileMode.Eco,
+        2 => ResourceProfileMode.Maximum,
+        _ => ResourceProfileMode.Balanced
+    };
+    return EngineResourceProfile.FromMode(mode);
+}
+
     {
         if (_repoCreationCts != null) return;
         if (string.IsNullOrEmpty(_selectedNewRepoDir) || !Directory.Exists(_selectedNewRepoDir))
