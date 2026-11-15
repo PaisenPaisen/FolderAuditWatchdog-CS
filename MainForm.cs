@@ -1037,7 +1037,7 @@ public class MainForm : Form
         top.Controls.Add(new Label { Text = "📈 Dashboard Integralności Repozytoriów", Font = new Font("Segoe UI", 12, FontStyle.Bold), Location = new Point(0, 6), AutoSize = true });
         top.Controls.Add(new Label { Text = "Zakres:", Font = new Font("Segoe UI", 9, FontStyle.Bold), Location = new Point(360, 9), AutoSize = true });
         _cmbDashScope = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Location = new Point(415, 5), Width = 180 };
-        _cmbDashScope.SelectedIndexChanged += (s, e) => RefreshDashboardTab();
+        _cmbDashScope.SelectedIndexChanged += (s, e) => { if (!_isSyncingCombos) RefreshDashboardTab(); };
         top.Controls.Add(_cmbDashScope);
 
         var btnCsv = new Button { Text = "Eksportuj historię CSV", Width = 160, Height = 28, Dock = DockStyle.Right };
@@ -1222,7 +1222,7 @@ public class MainForm : Form
         top.Controls.Add(new Label { Text = "Dziennik Zdarzeń Audytowych:", Font = new Font("Segoe UI", 11, FontStyle.Bold), AutoSize = true, Margin = new Padding(0, 5, 10, 0) });
 
         _cmbAuditRepo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 210 };
-        _cmbAuditRepo.SelectedIndexChanged += (s, e) => RefreshAuditTab();
+        _cmbAuditRepo.SelectedIndexChanged += (s, e) => { if (!_isSyncingCombos) RefreshAuditTab(); };
         top.Controls.Add(_cmbAuditRepo);
 
         var btnRef = new Button { Text = "Odśwież", Width = 95, Height = 28 };
