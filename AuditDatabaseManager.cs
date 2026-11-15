@@ -23,7 +23,9 @@ public class AuditDatabaseManager
         cmd.CommandText = @"
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
-            PRAGMA cache_size=-32000;";
+            PRAGMA cache_size=-64000;
+            PRAGMA temp_store=MEMORY;
+            PRAGMA mmap_size=268435456;";
         cmd.ExecuteNonQuery();
         return conn;
     }
@@ -85,7 +87,7 @@ public class AuditDatabaseManager
         using var cmd = conn.CreateCommand();
         cmd.CommandText = @"
             INSERT INTO repositories (code, name, root_path, owner, status, created_at, last_scan_at)
-            VALUES ($code, $name, $path, $owner, 'Active', $created, $scan);
+            VALUES ($code,$name, $path,$owner, 'Active', $created,$scan);
             SELECT last_insert_rowid();";
         cmd.Parameters.AddWithValue("$code", code);
         cmd.Parameters.AddWithValue("$name", name);
@@ -126,7 +128,7 @@ public class AuditDatabaseManager
     {
         using var conn = GetConnection();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "UPDATE repositories SET status = $st WHERE id = $id";
+        cmd.CommandText = "UPDATE repositories SET status = $st WHERE id =$id";
         cmd.Parameters.AddWithValue("$st", status);
         cmd.Parameters.AddWithValue("$id", repoId);
         cmd.ExecuteNonQuery();
@@ -136,7 +138,7 @@ public class AuditDatabaseManager
     {
         using var conn = GetConnection();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "UPDATE repositories SET last_scan_at = $ts WHERE id = $id";
+        cmd.CommandText = "UPDATE repositories SET last_scan_at = $ts WHERE id =$id";
         cmd.Parameters.AddWithValue("$ts", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
         cmd.Parameters.AddWithValue("$id", repoId);
         cmd.ExecuteNonQuery();
@@ -150,7 +152,7 @@ public class AuditDatabaseManager
         cmd.CommandText = @"
             INSERT OR REPLACE INTO baseline_files
             (repo_id, relative_path, filename, file_hash, file_size, last_mtime, integrity_status, baseline_updated_at, updated_by)
-            VALUES ($repo, $rel, $fname, $hash, $size, $mtime, 'ZGODNY', $updAt, $updBy)";
+            VALUES ($repo,$rel, $fname,$hash, $size,$mtime, 'ZGODNY', $updAt,$updBy)";
 
         var pRepo = cmd.Parameters.Add("$repo", SqliteType.Integer);
         var pRel = cmd.Parameters.Add("$rel", SqliteType.Text);
@@ -181,7 +183,7 @@ public class AuditDatabaseManager
         using var conn = GetConnection();
         using var tx = conn.BeginTransaction();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "UPDATE baseline_files SET integrity_status = $st, file_size = $sz, last_mtime = $mt WHERE id = $id";
+        cmd.CommandText = "UPDATE baseline_files SET integrity_status = $st, file_size =$sz, last_mtime = $mt WHERE id =$id";
 
         var pSt = cmd.Parameters.Add("$st", SqliteType.Text);
         var pSz = cmd.Parameters.Add("$sz", SqliteType.Integer);
@@ -206,7 +208,7 @@ public class AuditDatabaseManager
         using var cmd = conn.CreateCommand();
         cmd.CommandText = @"
             UPDATE baseline_files
-            SET file_hash = $h, file_size = $sz, last_mtime = $mt, integrity_status = 'ZGODNY', baseline_updated_at = $ua, updated_by = $ub
+            SET file_hash = $h, file_size = $sz, last_mtime =$mt, integrity_status = 'ZGODNY', baseline_updated_at = $ua, updated_by =$ub
             WHERE id = $id";
 
         var pH = cmd.Parameters.Add("$h", SqliteType.Text);
@@ -281,7 +283,7 @@ public class AuditDatabaseManager
         using var cmd = conn.CreateCommand();
         cmd.CommandText = @"
             INSERT INTO scan_snapshots (timestamp, operator, scope, total_files, ok_count, new_count, modified_count, deleted_count, total_size_mb)
-            VALUES ($ts, $op, $sc, $tot, $ok, $nw, $mod, $del, $sz)";
+            VALUES ($ts, $op,$sc, $tot,$ok, $nw,$mod, $del,$sz)";
         cmd.Parameters.AddWithValue("$ts", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
         cmd.Parameters.AddWithValue("$op", op);
         cmd.Parameters.AddWithValue("$sc", scope);
