@@ -1,1 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
 
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <!-- Metadane wersji (zastępują version_info.txt z PyInstallera) -->
+    <AssemblyName>FolderAuditWatchdog</AssemblyName>
+    <Product>Folder Audit Watchdog</Product>
+    <Title>Folder Audit Watchdog – Nadzór Integralności Repozytoriów</Title>
+    <Description>Narzędzie audytowe do weryfikacji integralności plików i linii bazowej (SHA-256).</Description>
+    <Company>PM Engineering Tools</Company>
+    <Copyright>Copyright © 2026</Copyright>
+    <Version>1.0.0</Version>
+    <FileVersion>1.0.0.0</FileVersion>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.10" />
+    <PackageReference Include="QuestPDF" Version="2024.10.3" />
+  </ItemGroup>
+
+</Project>
