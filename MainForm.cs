@@ -1,5 +1,7 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -15,6 +17,7 @@ public class MainForm : Form
     private readonly string _configFile;
     private readonly string _vaultDir;
     private readonly AuditDatabaseManager _db;
+    private readonly RepositoryEngine _engine;
 
     private string? _selectedNewRepoDir;
     private List<ScanResultItem> _scanResultsCache = new();
@@ -23,6 +26,8 @@ public class MainForm : Form
     private int _currentScanPage = 0;
     private bool _isScanning = false;
     private bool _isSyncingCombos = false;
+    private CancellationTokenSource? _repoCreationCts;
+    private CancellationTokenSource? _auditScanCts;
 
     // Kontrolki nawigacji
     private TabControl _tabs = null!;
@@ -32,6 +37,10 @@ public class MainForm : Form
     private TextBox _txtRepoCode = null!;
     private TextBox _txtRepoName = null!;
     private TextBox _txtRepoOwner = null!;
+    private Button _btnCreateRepo = null!;
+    private Button _btnCancelRepo = null!;
+    private ProgressBar _pbRepoProgress = null!;
+    private Label _lblRepoProgress = null!;
     private CheckBox _chkRepoArch = null!;
     private DataGridView _gridRepos = null!;
 
@@ -39,6 +48,7 @@ public class MainForm : Form
     private ComboBox _cmbMonRepo = null!;
     private Button _btnScanFast = null!;
     private Button _btnScanDeep = null!;
+    private Button _btnCancelScan = null!;
     private CheckBox _chkMtimeOnly = null!;
     private Label _lblMonSummary = null!;
     private ComboBox _cmbMonFilter = null!;
@@ -76,6 +86,7 @@ public class MainForm : Form
         _configFile = Path.Combine(_appDir, "audit_watchdog_config.json");
         _vaultDir = LoadVaultDir();
         _db = new AuditDatabaseManager(_vaultDir);
+        _engine = new RepositoryEngine(_db);
 
         Text = "Folder Audit Watchdog – Nadzór Integralności Repozytoriów";
         Size = new Size(1420, 850);
@@ -149,13 +160,12 @@ public class MainForm : Form
     }
 
     // =========================================================================
-    // ZAKŁADKA 0: REPOZYTORIA
+    // ZAKŁADKA 0: REPOZYTORIA (Z IZOLOWANYM POSTĘPEM I ANULOWANIEM)
     // =========================================================================
     private void BuildReposTab(TabPage tab)
     {
         var split = new SplitContainer { Dock = DockStyle.Fill, SplitterDistance = 390, FixedPanel = FixedPanel.Panel1, Padding = new Padding(10) };
 
-        // Lewy panel formularza
         var left = split.Panel1;
         int y = 15;
         left.Controls.Add(new Label { Text = "Dodaj lokalizację do nadzoru", Font = new Font("Segoe UI", 11, FontStyle.Bold), Location = new Point(10, y), AutoSize = true });
@@ -190,7 +200,7 @@ public class MainForm : Form
         left.Controls.Add(_txtRepoOwner);
         y += 45;
 
-        var btnCreate = new Button
+        _btnCreateRepo = new Button
         {
             Text = "🛡️ Utwórz Linię Bazową (Baseline)",
             BackColor = Color.FromArgb(16, 124, 65),
@@ -200,8 +210,38 @@ public class MainForm : Form
             Location = new Point(10, y),
             Size = new Size(350, 40)
         };
-        btnCreate.Click += async (s, e) => await RegisterNewRepositoryAsync();
-        left.Controls.Add(btnCreate);
+        _btnCreateRepo.Click += async (s, e) => await RegisterNewRepositoryAsync();
+        left.Controls.Add(_btnCreateRepo);
+
+        _pbRepoProgress = new ProgressBar
+        {
+            Location = new Point(10, y + 48),
+            Size = new Size(255, 22),
+            Style = ProgressBarStyle.Marquee,
+            MarqueeAnimationSpeed = 25,
+            Visible = false
+        };
+
+        _btnCancelRepo = new Button
+        {
+            Text = "Anuluj",
+            Location = new Point(275, y + 46),
+            Size = new Size(85, 26),
+            Visible = false
+        };
+        _btnCancelRepo.Click += (s, e) => _repoCreationCts?.Cancel();
+
+        _lblRepoProgress = new Label
+        {
+            Text = "",
+            Location = new Point(10, y + 76),
+            Size = new Size(350, 42),
+            ForeColor = Color.FromArgb(31, 83, 141),
+            Font = new Font("Segoe UI", 8.5f),
+            Visible = false
+        };
+
+        left.Controls.AddRange(new Control[] { _pbRepoProgress, _btnCancelRepo, _lblRepoProgress });
 
         // Prawy panel listy
         var right = split.Panel2;
@@ -223,6 +263,11 @@ public class MainForm : Form
         {
             if (_gridRepos.CurrentRow?.DataBoundItem is RepositoryInfo r)
             {
+                if (r.Status == "Building")
+                {
+                    MessageBox.Show("Trwa indeksowanie tego repozytorium. Poczekaj na zakończenie lub kliknij Anuluj.", "Operacja w toku", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
                 string next = r.Status == "Active" ? "Archived" : "Active";
                 _db.SetRepositoryStatus(r.Id, next);
                 LogAuditTrail(r.RootPath, "REPO_STATUS_CHANGED", r.Code, $"Zmieniono status repozytorium na: {next}");
@@ -267,7 +312,7 @@ public class MainForm : Form
 
     private async Task RegisterNewRepositoryAsync()
     {
-        if (_isScanning) return;
+        if (_repoCreationCts != null) return;
         if (string.IsNullOrEmpty(_selectedNewRepoDir) || !Directory.Exists(_selectedNewRepoDir))
         {
             MessageBox.Show("Wybierz istniejący katalog do objęcia nadzorem.", "Brak folderu", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -296,52 +341,54 @@ public class MainForm : Form
             return;
         }
 
-        _isScanning = true;
-        Cursor = Cursors.WaitCursor;
+        _db.SetRepositoryStatus(repoId, "Building");
+        RefreshRepositoriesList();
+
+        _repoCreationCts = new CancellationTokenSource();
+        _btnCreateRepo.Enabled = false;
+        _pbRepoProgress.Visible = true;
+        _btnCancelRepo.Visible = true;
+        _lblRepoProgress.Visible = true;
+        _lblRepoProgress.Text = "Inicjalizacja potoku skanowania...";
+
+        var progress = new Progress<ScanProgressReport>(rep =>
+        {
+            double mb = rep.ProcessedBytes / (1024.0 * 1024.0);
+            _lblRepoProgress.Text = $"{rep.Phase}\nPliki: {rep.ProcessedFiles:N0} ({mb:N1} MB) | {rep.CurrentFile}";
+        });
 
         try
         {
-            int count = await Task.Run(() =>
-            {
-                string nowStr = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-                var files = EnumerateRepoFiles(rootDir).ToList();
-                var bag = new ConcurrentBag<(int, string, string, string, long, double, string, string)>();
-                long totalBytes = 0;
+            int count = await _engine.CreateBaselineStreamedAsync(
+                repoId, code, rootDir, owner, _currentUser, progress, _repoCreationCts.Token);
 
-                Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = GetWorkerCount() }, fPath =>
-                {
-                    try
-                    {
-                        var fi = new FileInfo(fPath);
-                        string rel = Path.GetRelativePath(rootDir, fPath).Replace('\\', '/');
-                        string hash = CalculateSha256Short(fPath);
-                        double mtime = ToUnixTimestamp(fi.LastWriteTimeUtc);
-                        Interlocked.Add(ref totalBytes, fi.Length);
-                        bag.Add((repoId, rel, fi.Name, hash, fi.Length, mtime, nowStr, _currentUser));
-                    }
-                    catch { }
-                });
-
-                var records = bag.ToList();
-                _db.BulkInsertBaseline(records);
-                _db.AddSnapshot(_currentUser, code, records.Count, records.Count, 0, 0, 0, totalBytes / (1024.0 * 1024.0));
-                LogAuditTrail(rootDir, "BASELINE_CREATED", code, $"Utworzono linię bazową dla {records.Count} plików (Właściciel: {owner}).");
-                return records.Count;
-            });
+            _db.SetRepositoryStatus(repoId, "Active");
+            LogAuditTrail(rootDir, "BASELINE_CREATED", code, $"Utworzono linię bazową dla {count} plików (Właściciel: {owner}).");
 
             _txtRepoCode.Clear();
             _txtRepoName.Clear();
             _selectedNewRepoDir = null;
             _lblPickedRepo.Text = "Nie wybrano folderu";
             _lblPickedRepo.ForeColor = Color.Gray;
+
             RefreshRepositoriesList();
             SyncRepoDropdowns();
-            MessageBox.Show($"Repozytorium '{code}' zostało objęte nadzorem.\nZarejestrowano {count} plików wzorcowych.", "Linia Bazowa Utworzona", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show($"Repozytorium '{code}' zostało objęte nadzorem.\nZarejestrowano {count:N0} plików wzorcowych.", "Linia Bazowa Utworzona", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (OperationCanceledException)
+        {
+            _db.SetRepositoryStatus(repoId, "Cancelled");
+            MessageBox.Show($"Tworzenie linii bazowej dla '{code}' zostało anulowane.", "Anulowano", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
         finally
         {
-            _isScanning = false;
-            Cursor = Cursors.Default;
+            _repoCreationCts.Dispose();
+            _repoCreationCts = null;
+            _btnCreateRepo.Enabled = true;
+            _pbRepoProgress.Visible = false;
+            _btnCancelRepo.Visible = false;
+            _lblRepoProgress.Visible = false;
+            RefreshRepositoriesList();
         }
     }
 
@@ -359,7 +406,7 @@ public class MainForm : Form
         SyncCombo(_cmbExpRepo, active);
     }
 
-   private void SyncCombo(ComboBox cmb, List<string> codes)
+    private void SyncCombo(ComboBox cmb, List<string> codes)
     {
         _isSyncingCombos = true;
         try
@@ -384,7 +431,7 @@ public class MainForm : Form
     }
 
     // =========================================================================
-    // ZAKŁADKA 1: MONITOR ZMIAN
+    // ZAKŁADKA 1: MONITOR ZMIAN (ZOPTYMALIZOWANE SKANOWANIE I RENDEROWANIE)
     // =========================================================================
     private void BuildMonitorTab(TabPage tab)
     {
@@ -400,9 +447,13 @@ public class MainForm : Form
         _btnScanFast.Click += async (s, e) => await RunRepositoryAuditScanAsync(false);
         pTop.Controls.Add(_btnScanFast);
 
-        _btnScanDeep = new Button { Text = "🔐 Pełny audyt SHA-256", Width = 165, Height = 29, Margin = new Padding(4, 2, 8, 0) };
+        _btnScanDeep = new Button { Text = "🔐 Pełny audyt SHA-256", Width = 165, Height = 29, Margin = new Padding(4, 2, 4, 0) };
         _btnScanDeep.Click += async (s, e) => await RunRepositoryAuditScanAsync(true);
         pTop.Controls.Add(_btnScanDeep);
+
+        _btnCancelScan = new Button { Text = "⏹ Anuluj", Width = 75, Height = 29, Margin = new Padding(2, 2, 8, 0), Visible = false };
+        _btnCancelScan.Click += (s, e) => _auditScanCts?.Cancel();
+        pTop.Controls.Add(_btnCancelScan);
 
         _chkMtimeOnly = new CheckBox { Text = "Traktuj zmianę mtime jako zmianę", AutoSize = true, Margin = new Padding(6, 6, 8, 0) };
         _chkMtimeOnly.CheckedChanged += async (s, e) => { if (!_isScanning && _cmbMonRepo.Text != "Brak") await RunRepositoryAuditScanAsync(false); };
@@ -512,11 +563,20 @@ public class MainForm : Form
         }
 
         _isScanning = true;
+        _auditScanCts = new CancellationTokenSource();
+        var ct = _auditScanCts.Token;
+
         _btnScanFast.Enabled = false;
         _btnScanDeep.Enabled = false;
-        _lblMonSummary.Text = "Trwa skanowanie dysku w tle...";
+        _btnCancelScan.Visible = true;
+        _lblMonSummary.Text = "Wczytywanie linii bazowej...";
         _lblMonSummary.ForeColor = Color.FromArgb(217, 119, 6);
         bool mtimeOnly = _chkMtimeOnly.Checked;
+
+        var progress = new Progress<int>(count =>
+        {
+            _lblMonSummary.Text = $"Skanowanie w toku... zweryfikowano {count:N0} plików";
+        });
 
         try
         {
@@ -527,105 +587,131 @@ public class MainForm : Form
                 var resultBag = new ConcurrentBag<ScanResultItem>();
                 var statusUpdates = new ConcurrentBag<(string, long, double, int)>();
 
-                int ok = 0, nw = 0, mod = 0, del = 0;
+                int ok = 0, nw = 0, mod = 0, del = 0, scanned = 0;
                 long totalBytes = 0;
+                long lastReportTicks = 0;
 
-                var diskFiles = EnumerateRepoFiles(repo.RootPath).ToList();
-
-                Parallel.ForEach(diskFiles, new ParallelOptions { MaxDegreeOfParallelism = GetWorkerCount() }, fPath =>
+                // Optymalna równoległość dla I/O dyskowego (bez thrashingu)
+                int workerCount = Math.Clamp(Environment.ProcessorCount / 2, 2, 6);
+                var parallelOpts = new ParallelOptions
                 {
-                    try
+                    MaxDegreeOfParallelism = workerCount,
+                    CancellationToken = ct
+                };
+
+                // Strumieniowa enumeracja bez .ToList() i bufor wielokrotnego użytku dla każdego wątku
+                Parallel.ForEach(
+                    EnumerateRepoFilesFast(repo.RootPath),
+                    parallelOpts,
+                    () => ArrayPool<byte>.Shared.Rent(262144),
+                    (fPath, state, buffer) =>
                     {
-                        var fi = new FileInfo(fPath);
-                        string relP = Path.GetRelativePath(repo.RootPath, fPath).Replace('\\', '/');
-                        string? parentRel = Path.GetDirectoryName(relP)?.Replace('\\', '/');
-                        string folderRel = string.IsNullOrEmpty(parentRel) || parentRel == "." ? "(Katalog główny)" : parentRel;
-
-                        long currSize = fi.Length;
-                        double currMtime = ToUnixTimestamp(fi.LastWriteTimeUtc);
-                        string mtimeStr = fi.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss");
-                        Interlocked.Add(ref totalBytes, currSize);
-
-                        if (baselineMap.TryGetValue(relP, out var bRow))
+                        try
                         {
-                            seenRel.TryAdd(relP, 0);
-                            bool mtimeChanged = Math.Abs(currMtime - bRow.LastMtime) >= 0.01;
-                            bool needsHash = forceSha256 || currSize != bRow.FileSize || mtimeChanged;
-                            string state;
+                            var fi = new FileInfo(fPath);
+                            if (!fi.Exists) return buffer;
 
-                            if (!needsHash && !mtimeOnly)
+                            string relP = Path.GetRelativePath(repo.RootPath, fPath).Replace('\\', '/');
+                            string? parentRel = Path.GetDirectoryName(relP)?.Replace('\\', '/');
+                            string folderRel = string.IsNullOrEmpty(parentRel) || parentRel == "." ? "(Katalog główny)" : parentRel;
+
+                            long currSize = fi.Length;
+                            double currMtime = ToUnixTimestamp(fi.LastWriteTimeUtc);
+                            string mtimeStr = fi.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss");
+                            Interlocked.Add(ref totalBytes, currSize);
+
+                            if (baselineMap.TryGetValue(relP, out var bRow))
                             {
-                                state = "ZGODNY";
-                            }
-                            else if (mtimeOnly && mtimeChanged && currSize == bRow.FileSize)
-                            {
-                                state = "ZMIENIONY";
+                                seenRel.TryAdd(relP, 0);
+                                bool mtimeChanged = Math.Abs(currMtime - bRow.LastMtime) >= 0.01;
+                                bool needsHash = forceSha256 || currSize != bRow.FileSize || mtimeChanged;
+                                string fileState;
+
+                                if (!needsHash && !mtimeOnly)
+                                {
+                                    fileState = "ZGODNY";
+                                }
+                                else if (mtimeOnly && mtimeChanged && currSize == bRow.FileSize)
+                                {
+                                    fileState = "ZMIENIONY";
+                                }
+                                else
+                                {
+                                    string currHash = CalculateSha256Pooled(fPath, buffer);
+                                    fileState = currHash != bRow.FileHash ? "ZMIENIONY" : "ZGODNY";
+                                }
+
+                                if (fileState == "ZGODNY")
+                                {
+                                    Interlocked.Increment(ref ok);
+                                    if (bRow.IntegrityStatus != "ZGODNY" || currSize != bRow.FileSize || mtimeChanged)
+                                        statusUpdates.Add(("ZGODNY", currSize, currMtime, bRow.Id));
+                                }
+                                else
+                                {
+                                    Interlocked.Increment(ref mod);
+                                    if (bRow.IntegrityStatus != "ZMIENIONY")
+                                        statusUpdates.Add(("ZMIENIONY", bRow.FileSize, bRow.LastMtime, bRow.Id));
+                                }
+
+                                resultBag.Add(new ScanResultItem
+                                {
+                                    State = fileState,
+                                    RelPath = folderRel,
+                                    FullRelPath = relP,
+                                    Filename = fi.Name,
+                                    SizeBytes = currSize,
+                                    Mtime = currMtime,
+                                    MtimeStr = mtimeStr,
+                                    BaselineDate = bRow.BaselineUpdatedAt,
+                                    Auditor = bRow.UpdatedBy ?? "-",
+                                    DbId = bRow.Id,
+                                    AbsPath = fPath,
+                                    RepoId = repo.Id,
+                                    RepoCode = repo.Code,
+                                    RepoRoot = repo.RootPath
+                                });
                             }
                             else
                             {
-                                string currHash = CalculateSha256Short(fPath);
-                                state = currHash != bRow.FileHash ? "ZMIENIONY" : "ZGODNY";
+                                Interlocked.Increment(ref nw);
+                                resultBag.Add(new ScanResultItem
+                                {
+                                    State = "NOWY",
+                                    RelPath = folderRel,
+                                    FullRelPath = relP,
+                                    Filename = fi.Name,
+                                    SizeBytes = currSize,
+                                    Mtime = currMtime,
+                                    MtimeStr = mtimeStr,
+                                    BaselineDate = "-",
+                                    Auditor = "-",
+                                    DbId = null,
+                                    AbsPath = fPath,
+                                    RepoId = repo.Id,
+                                    RepoCode = repo.Code,
+                                    RepoRoot = repo.RootPath
+                                });
                             }
 
-                            if (state == "ZGODNY")
+                            int currScanned = Interlocked.Increment(ref scanned);
+                            long nowTicks = Environment.TickCount64;
+                            long prevTicks = Interlocked.Read(ref lastReportTicks);
+                            if (nowTicks - prevTicks >= 250 && Interlocked.CompareExchange(ref lastReportTicks, nowTicks, prevTicks) == prevTicks)
                             {
-                                Interlocked.Increment(ref ok);
-                                if (bRow.IntegrityStatus != "ZGODNY" || currSize != bRow.FileSize || mtimeChanged)
-                                    statusUpdates.Add(("ZGODNY", currSize, currMtime, bRow.Id));
+                                ((IProgress<int>)progress).Report(currScanned);
                             }
-                            else
-                            {
-                                Interlocked.Increment(ref mod);
-                                if (bRow.IntegrityStatus != "ZMIENIONY")
-                                    statusUpdates.Add(("ZMIENIONY", bRow.FileSize, bRow.LastMtime, bRow.Id));
-                            }
-
-                            resultBag.Add(new ScanResultItem
-                            {
-                                State = state,
-                                RelPath = folderRel,
-                                FullRelPath = relP,
-                                Filename = fi.Name,
-                                SizeBytes = currSize,
-                                Mtime = currMtime,
-                                MtimeStr = mtimeStr,
-                                BaselineDate = bRow.BaselineUpdatedAt,
-                                Auditor = bRow.UpdatedBy ?? "-",
-                                DbId = bRow.Id,
-                                AbsPath = fPath,
-                                RepoId = repo.Id,
-                                RepoCode = repo.Code,
-                                RepoRoot = repo.RootPath
-                            });
                         }
-                        else
-                        {
-                            Interlocked.Increment(ref nw);
-                            resultBag.Add(new ScanResultItem
-                            {
-                                State = "NOWY",
-                                RelPath = folderRel,
-                                FullRelPath = relP,
-                                Filename = fi.Name,
-                                SizeBytes = currSize,
-                                Mtime = currMtime,
-                                MtimeStr = mtimeStr,
-                                BaselineDate = "-",
-                                Auditor = "-",
-                                DbId = null,
-                                AbsPath = fPath,
-                                RepoId = repo.Id,
-                                RepoCode = repo.Code,
-                                RepoRoot = repo.RootPath
-                            });
-                        }
-                    }
-                    catch { }
-                });
+                        catch { }
+                        return buffer;
+                    },
+                    buffer => ArrayPool<byte>.Shared.Return(buffer)
+                );
 
                 // Pliki usunięte z dysku
                 foreach (var kvp in baselineMap)
                 {
+                    ct.ThrowIfCancellationRequested();
                     if (!seenRel.ContainsKey(kvp.Key))
                     {
                         del++;
@@ -671,20 +757,28 @@ public class MainForm : Form
                                       .ToList();
 
                 return (sorted, ok, nw, mod, del);
-            });
+            }, ct);
 
             _scanResultsCache = results;
             int disc = newC + modC + delC;
-            _lblMonSummary.Text = $"Zgodne: {okC}  |  Nowe: {newC}  |  Zmienione: {modC}  |  Usunięte: {delC}";
+            _lblMonSummary.Text = $"Zgodne: {okC:N0}  |  Nowe: {newC:N0}  |  Zmienione: {modC:N0}  |  Usunięte: {delC:N0}";
             _lblMonSummary.ForeColor = disc == 0 ? Color.FromArgb(16, 124, 65) : Color.FromArgb(217, 119, 6);
             ApplyMonitorFilters(true);
             RefreshRepositoriesList();
         }
+        catch (OperationCanceledException)
+        {
+            _lblMonSummary.Text = "Skanowanie zostało przerwane przez operatora.";
+            _lblMonSummary.ForeColor = Color.DimGray;
+        }
         finally
         {
+            _auditScanCts?.Dispose();
+            _auditScanCts = null;
             _isScanning = false;
             _btnScanFast.Enabled = true;
             _btnScanDeep.Enabled = true;
+            _btnCancelScan.Visible = false;
         }
     }
 
@@ -715,27 +809,42 @@ public class MainForm : Form
 
     private void RenderMonitorPage()
     {
-        _gridMon.Rows.Clear();
         int total = _filteredScanCache.Count;
-        var pageItems = _filteredScanCache.Skip(_currentScanPage * PageSize).Take(PageSize);
+        var pageItems = _filteredScanCache.Skip(_currentScanPage * PageSize).Take(PageSize).ToList();
 
-        foreach (var item in pageItems)
+        _gridMon.SuspendLayout();
+        try
         {
-            int rIdx = _gridMon.Rows.Add(
-                item.State,
-                item.RelPath,
-                item.Filename,
-                $"{item.SizeBytes / 1024.0:N1}",
-                item.MtimeStr,
-                item.BaselineDate,
-                item.Auditor
-            );
-            _gridMon.Rows[rIdx].Tag = item;
+            _gridMon.Rows.Clear();
+            if (pageItems.Count > 0)
+            {
+                var rows = new DataGridViewRow[pageItems.Count];
+                for (int i = 0; i < pageItems.Count; i++)
+                {
+                    var item = pageItems[i];
+                    var row = new DataGridViewRow();
+                    row.CreateCells(_gridMon,
+                        item.State,
+                        item.RelPath,
+                        item.Filename,
+                        $"{item.SizeBytes / 1024.0:N1}",
+                        item.MtimeStr,
+                        item.BaselineDate,
+                        item.Auditor);
+                    row.Tag = item;
+                    rows[i] = row;
+                }
+                _gridMon.Rows.AddRange(rows);
+            }
+        }
+        finally
+        {
+            _gridMon.ResumeLayout();
         }
 
         int maxPage = Math.Max(1, (total + PageSize - 1) / PageSize);
         int currDisp = _currentScanPage + 1;
-        _lblMonPage.Text = $"Strona {currDisp} z {maxPage} ({total} pozycji)";
+        _lblMonPage.Text = $"Strona {currDisp} z {maxPage} ({total:N0} pozycji)";
         _btnMonPrev.Enabled = _currentScanPage > 0;
         _btnMonNext.Enabled = currDisp < maxPage;
     }
@@ -802,40 +911,51 @@ public class MainForm : Form
         string? reason = PromptAuditReason(itemsToAccept.Count);
         if (reason == null) return;
 
-        string nowStr = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-        var newInserts = new List<(int, string, string, string, long, double, string, string)>();
-        var modUpdates = new List<(string, long, double, string, string, int)>();
-        var delIds = new List<int>();
-        string repoRoot = itemsToAccept[0].RepoRoot;
-
-        foreach (var item in itemsToAccept)
+        await Task.Run(() =>
         {
-            if (item.State == "NOWY" && File.Exists(item.AbsPath))
-            {
-                var fi = new FileInfo(item.AbsPath);
-                string hash = CalculateSha256Short(item.AbsPath);
-                newInserts.Add((item.RepoId, item.FullRelPath, item.Filename, hash, fi.Length, ToUnixTimestamp(fi.LastWriteTimeUtc), nowStr, _currentUser));
-                LogAuditTrail(repoRoot, "BASELINE_ADD_NEW", item.FullRelPath, $"Zatwierdzono nowy plik | Powód: {reason}");
-            }
-            else if (item.State == "ZMIENIONY" && File.Exists(item.AbsPath) && item.DbId.HasValue)
-            {
-                var fi = new FileInfo(item.AbsPath);
-                string hash = CalculateSha256Short(item.AbsPath);
-                modUpdates.Add((hash, fi.Length, ToUnixTimestamp(fi.LastWriteTimeUtc), nowStr, _currentUser, item.DbId.Value));
-                LogAuditTrail(repoRoot, "BASELINE_ACCEPT_MODIFIED", item.FullRelPath, $"Zatwierdzono modyfikację (nowy hash: {hash}) | Powód: {reason}");
-            }
-            else if (item.State == "USUNIĘTY" && item.DbId.HasValue)
-            {
-                delIds.Add(item.DbId.Value);
-                LogAuditTrail(repoRoot, "BASELINE_CONFIRM_DELETED", item.FullRelPath, $"Potwierdzono usunięcie pliku z repozytorium | Powód: {reason}");
-            }
-        }
+            string nowStr = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+            var newInserts = new List<(int, string, string, string, long, double, string, string)>();
+            var modUpdates = new List<(string, long, double, string, string, int)>();
+            var delIds = new List<int>();
+            string repoRoot = itemsToAccept[0].RepoRoot;
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(262144);
 
-        _db.BulkInsertBaseline(newInserts);
-        _db.AcceptModifiedFiles(modUpdates);
-        _db.DeleteBaselineRecords(delIds);
+            try
+            {
+                foreach (var item in itemsToAccept)
+                {
+                    if (item.State == "NOWY" && File.Exists(item.AbsPath))
+                    {
+                        var fi = new FileInfo(item.AbsPath);
+                        string hash = CalculateSha256Pooled(item.AbsPath, buffer);
+                        newInserts.Add((item.RepoId, item.FullRelPath, item.Filename, hash, fi.Length, ToUnixTimestamp(fi.LastWriteTimeUtc), nowStr, _currentUser));
+                        LogAuditTrail(repoRoot, "BASELINE_ADD_NEW", item.FullRelPath, $"Zatwierdzono nowy plik | Powód: {reason}");
+                    }
+                    else if (item.State == "ZMIENIONY" && File.Exists(item.AbsPath) && item.DbId.HasValue)
+                    {
+                        var fi = new FileInfo(item.AbsPath);
+                        string hash = CalculateSha256Pooled(item.AbsPath, buffer);
+                        modUpdates.Add((hash, fi.Length, ToUnixTimestamp(fi.LastWriteTimeUtc), nowStr, _currentUser, item.DbId.Value));
+                        LogAuditTrail(repoRoot, "BASELINE_ACCEPT_MODIFIED", item.FullRelPath, $"Zatwierdzono modyfikację (nowy hash: {hash}) | Powód: {reason}");
+                    }
+                    else if (item.State == "USUNIĘTY" && item.DbId.HasValue)
+                    {
+                        delIds.Add(item.DbId.Value);
+                        LogAuditTrail(repoRoot, "BASELINE_CONFIRM_DELETED", item.FullRelPath, $"Potwierdzono usunięcie pliku z repozytorium | Powód: {reason}");
+                    }
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
 
-        MessageBox.Show($"Zaktualizowano Linię Bazową dla {itemsToAccept.Count} plików i zapisano wpis w Audit Trail.", "Zatwierdzono", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            _db.BulkInsertBaseline(newInserts);
+            _db.AcceptModifiedFiles(modUpdates);
+            _db.DeleteBaselineRecords(delIds);
+        });
+
+        MessageBox.Show($"Zaktualizowano Linię Bazową dla {itemsToAccept.Count:N0} plików i zapisano wpis w Audit Trail.", "Zatwierdzono", MessageBoxButtons.OK, MessageBoxIcon.Information);
         await RunRepositoryAuditScanAsync(false);
     }
 
@@ -845,12 +965,11 @@ public class MainForm : Form
         using var sfd = new SaveFileDialog { Filter = "CSV (*.csv)|*.csv", FileName = "Raport_Zmian_Repozytorium.csv" };
         if (sfd.ShowDialog() != DialogResult.OK) return;
 
-        var sb = new StringBuilder();
-        sb.AppendLine("Stan Integralności;Folder Względny;Nazwa Pliku;Rozmiar [B];Data Modyfikacji (Dysk);Data Linii Bazowej;Zatwierdził");
+        using var sw = new StreamWriter(sfd.FileName, false, new UTF8Encoding(true));
+        sw.WriteLine("Stan Integralności;Folder Względny;Nazwa Pliku;Rozmiar [B];Data Modyfikacji (Dysk);Data Linii Bazowej;Zatwierdził");
         foreach (var i in _filteredScanCache)
-            sb.AppendLine($"{i.State};{i.RelPath};{i.Filename};{i.SizeBytes};{i.MtimeStr};{i.BaselineDate};{i.Auditor}");
+            sw.WriteLine($"{i.State};{i.RelPath};{i.Filename};{i.SizeBytes};{i.MtimeStr};{i.BaselineDate};{i.Auditor}");
 
-        File.WriteAllText(sfd.FileName, sb.ToString(), new UTF8Encoding(true));
         MessageBox.Show($"Zapisano raport do:\n{sfd.FileName}", "Eksport", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
@@ -862,7 +981,7 @@ public class MainForm : Form
         var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 38, Padding = new Padding(8, 4, 8, 0) };
         top.Controls.Add(new Label { Text = "Repozytorium:", AutoSize = true, Margin = new Padding(0, 6, 5, 0), Font = new Font("Segoe UI", 9, FontStyle.Bold) });
         _cmbExpRepo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 190 };
-        _cmbExpRepo.SelectedIndexChanged += (s, e) => OnExplorerRepoSelected(_cmbExpRepo.Text);
+        _cmbExpRepo.SelectedIndexChanged += (s, e) => { if (!_isSyncingCombos) OnExplorerRepoSelected(_cmbExpRepo.Text); };
         top.Controls.Add(_cmbExpRepo);
 
         var btnRef = new Button { Text = "🔄 Odśwież drzewo", Width = 140, Height = 27 };
@@ -929,14 +1048,22 @@ public class MainForm : Form
 
         _currExpRepoId = repo.Id;
         _currExpRepoRoot = repo.RootPath;
-        _treeExpFolders.Nodes.Clear();
-        _gridExpFiles.Rows.Clear();
+        _treeExpFolders.BeginUpdate();
+        try
+        {
+            _treeExpFolders.Nodes.Clear();
+            _gridExpFiles.Rows.Clear();
 
-        if (!Directory.Exists(_currExpRepoRoot)) return;
-        var rootNode = new TreeNode($"📁 {code}") { Tag = ("", _currExpRepoRoot) };
-        _treeExpFolders.Nodes.Add(rootNode);
-        PopulateExpFolders("", _currExpRepoRoot, rootNode);
-        rootNode.Expand();
+            if (!Directory.Exists(_currExpRepoRoot)) return;
+            var rootNode = new TreeNode($"📁 {code}") { Tag = ("", _currExpRepoRoot) };
+            _treeExpFolders.Nodes.Add(rootNode);
+            PopulateExpFolders("", _currExpRepoRoot, rootNode);
+            rootNode.Expand();
+        }
+        finally
+        {
+            _treeExpFolders.EndUpdate();
+        }
     }
 
     private static void PopulateExpFolders(string relStr, string physDir, TreeNode parent)
@@ -959,12 +1086,13 @@ public class MainForm : Form
     private void OnExplorerFolderSelected(TreeNode? node)
     {
         if (node?.Tag is not ValueTuple<string, string> info) return;
-        _gridExpFiles.Rows.Clear();
         var (relFolder, physFolder) = info;
         if (!Directory.Exists(physFolder)) return;
 
         var baselineMap = _db.GetRepoBaselineMap(_currExpRepoId);
         var seenRel = new HashSet<string>(StringComparer.Ordinal);
+        var newRows = new List<DataGridViewRow>();
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(262144);
 
         try
         {
@@ -986,7 +1114,7 @@ public class MainForm : Form
                     else if (fi.Length == bRow.FileSize && !mtChg)
                         state = "ZGODNY";
                     else
-                        state = CalculateSha256Short(fPath) != bRow.FileHash ? "ZMIENIONY" : "ZGODNY";
+                        state = CalculateSha256Pooled(fPath, buffer) != bRow.FileHash ? "ZMIENIONY" : "ZGODNY";
                     bDate = bRow.BaselineUpdatedAt;
                 }
                 else
@@ -995,8 +1123,10 @@ public class MainForm : Form
                     bDate = "-";
                 }
 
-                int idx = _gridExpFiles.Rows.Add(fi.Name, state, sizeKb, mtimeStr, bDate);
-                _gridExpFiles.Rows[idx].Tag = fPath;
+                var row = new DataGridViewRow();
+                row.CreateCells(_gridExpFiles, fi.Name, state, sizeKb, mtimeStr, bDate);
+                row.Tag = fPath;
+                newRows.Add(row);
             }
 
             foreach (var kvp in baselineMap)
@@ -1006,12 +1136,30 @@ public class MainForm : Form
                 if (string.IsNullOrEmpty(pRel) || pRel == ".") pRel = "";
                 if (pRel == relFolder)
                 {
-                    int idx = _gridExpFiles.Rows.Add(kvp.Value.Filename, "USUNIĘTY", $"{kvp.Value.FileSize / 1024.0:N1}", "Brak na dysku", kvp.Value.BaselineUpdatedAt);
-                    _gridExpFiles.Rows[idx].Tag = Path.Combine(_currExpRepoRoot, kvp.Key.Replace('/', Path.DirectorySeparatorChar));
+                    var row = new DataGridViewRow();
+                    row.CreateCells(_gridExpFiles, kvp.Value.Filename, "USUNIĘTY", $"{kvp.Value.FileSize / 1024.0:N1}", "Brak na dysku", kvp.Value.BaselineUpdatedAt);
+                    row.Tag = Path.Combine(_currExpRepoRoot, kvp.Key.Replace('/', Path.DirectorySeparatorChar));
+                    newRows.Add(row);
                 }
             }
         }
         catch { }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+
+        _gridExpFiles.SuspendLayout();
+        try
+        {
+            _gridExpFiles.Rows.Clear();
+            if (newRows.Count > 0)
+                _gridExpFiles.Rows.AddRange(newRows.ToArray());
+        }
+        finally
+        {
+            _gridExpFiles.ResumeLayout();
+        }
     }
 
     private static TreeNode? FindTreeNodeByPath(TreeNodeCollection nodes, string targetDir)
@@ -1044,7 +1192,6 @@ public class MainForm : Form
         btnCsv.Click += (s, e) => ExportDashboardCsv();
         top.Controls.Add(btnCsv);
 
-        // Karty KPI
         var kpiTable = new TableLayoutPanel { Dock = DockStyle.Top, Height = 92, ColumnCount = 5, RowCount = 1, Padding = new Padding(0, 6, 0, 6) };
         for (int i = 0; i < 5; i++) kpiTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 20f));
 
@@ -1054,12 +1201,10 @@ public class MainForm : Form
         (_kpiNewV, _kpiNewS) = AddKpiCard(kpiTable, 3, "NOWE / NIEZATWIERDZONE", Color.FromArgb(0, 120, 212));
         (_kpiDelV, _kpiDelS) = AddKpiCard(kpiTable, 4, "USUNIĘTE Z DYSKU", Color.FromArgb(209, 52, 56));
 
-        // Panel wykresu trendu
         _chartPanel = new Panel { Dock = DockStyle.Top, Height = 195, BackColor = Color.FromArgb(248, 250, 252), BorderStyle = BorderStyle.FixedSingle };
         _chartPanel.Paint += (s, e) => DrawTrendChart(e.Graphics, _chartPanel.ClientRectangle);
         _chartPanel.Resize += (s, e) => _chartPanel.Invalidate();
 
-        // Tabela migawek
         _gridSnaps = CreateStyledGrid();
         _gridSnaps.Columns.AddRange(new DataGridViewColumn[]
         {
@@ -1109,15 +1254,15 @@ public class MainForm : Form
             string deltaStr = snaps.Count >= 2 ? $"{last.TotalFiles - snaps[^2].TotalFiles:+0;-0;0} od poprzedniego skanu" : "Pierwszy pomiar";
             double health = (last.TotalFiles + last.DeletedCount) > 0 ? (last.OkCount * 100.0 / (last.TotalFiles + last.DeletedCount)) : 100.0;
 
-            _kpiTotV.Text = last.TotalFiles.ToString();
+            _kpiTotV.Text = last.TotalFiles.ToString("N0");
             _kpiTotS.Text = $"{deltaStr} ({last.TotalSizeMb:F1} MB)";
             _kpiIntV.Text = $"{health:F1}%";
-            _kpiIntS.Text = $"{last.OkCount} zgodnych z Baseline";
-            _kpiModV.Text = last.ModifiedCount.ToString();
+            _kpiIntS.Text = $"{last.OkCount:N0} zgodnych z Baseline";
+            _kpiModV.Text = last.ModifiedCount.ToString("N0");
             _kpiModS.Text = "Zmienione po Baseline";
-            _kpiNewV.Text = last.NewCount.ToString();
+            _kpiNewV.Text = last.NewCount.ToString("N0");
             _kpiNewS.Text = "Nowe pliki w folderach";
-            _kpiDelV.Text = last.DeletedCount.ToString();
+            _kpiDelV.Text = last.DeletedCount.ToString("N0");
             _kpiDelS.Text = "Brakujące na dysku";
         }
         else
@@ -1125,12 +1270,28 @@ public class MainForm : Form
             _kpiTotV.Text = _kpiIntV.Text = _kpiModV.Text = _kpiNewV.Text = _kpiDelV.Text = "0";
         }
 
-        _gridSnaps.Rows.Clear();
-        for (int i = snaps.Count - 1; i >= 0; i--)
+        _gridSnaps.SuspendLayout();
+        try
         {
-            var s = snaps[i];
-            string diff = i > 0 ? $"{s.TotalFiles - snaps[i - 1].TotalFiles:+0;-0;0}" : "Start";
-            _gridSnaps.Rows.Add(s.Timestamp, s.Operator, s.Scope, s.TotalFiles, diff, s.OkCount, s.NewCount, s.ModifiedCount, s.DeletedCount, $"{s.TotalSizeMb:F2}");
+            _gridSnaps.Rows.Clear();
+            if (snaps.Count > 0)
+            {
+                var rows = new DataGridViewRow[snaps.Count];
+                int rIdx = 0;
+                for (int i = snaps.Count - 1; i >= 0; i--)
+                {
+                    var s = snaps[i];
+                    string diff = i > 0 ? $"{s.TotalFiles - snaps[i - 1].TotalFiles:+0;-0;0}" : "Start";
+                    var row = new DataGridViewRow();
+                    row.CreateCells(_gridSnaps, s.Timestamp, s.Operator, s.Scope, s.TotalFiles, diff, s.OkCount, s.NewCount, s.ModifiedCount, s.DeletedCount, $"{s.TotalSizeMb:F2}");
+                    rows[rIdx++] = row;
+                }
+                _gridSnaps.Rows.AddRange(rows);
+            }
+        }
+        finally
+        {
+            _gridSnaps.ResumeLayout();
         }
         _chartPanel.Invalidate();
     }
@@ -1203,12 +1364,11 @@ public class MainForm : Form
         using var sfd = new SaveFileDialog { Filter = "CSV (*.csv)|*.csv", FileName = "Trendy_Audytu_Repozytorium.csv" };
         if (sfd.ShowDialog() != DialogResult.OK) return;
 
-        var sb = new StringBuilder();
-        sb.AppendLine("Data i godzina;Audytor;Repozytorium;Pliki;Przyrost;Zgodne;Nowe;Zmienione;Usunięte;Rozmiar [MB]");
+        using var sw = new StreamWriter(sfd.FileName, false, new UTF8Encoding(true));
+        sw.WriteLine("Data i godzina;Audytor;Repozytorium;Pliki;Przyrost;Zgodne;Nowe;Zmienione;Usunięte;Rozmiar [MB]");
         foreach (DataGridViewRow row in _gridSnaps.Rows)
-            sb.AppendLine(string.Join(";", row.Cells.Cast<DataGridViewCell>().Select(c => c.Value?.ToString() ?? "")));
+            sw.WriteLine(string.Join(";", row.Cells.Cast<DataGridViewCell>().Select(c => c.Value?.ToString() ?? "")));
 
-        File.WriteAllText(sfd.FileName, sb.ToString(), new UTF8Encoding(true));
         MessageBox.Show($"Zapisano historię trendów do:\n{sfd.FileName}", "Eksport", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
@@ -1256,21 +1416,35 @@ public class MainForm : Form
         SyncCombo(_cmbAuditRepo, opts);
 
         string curr = _cmbAuditRepo.Text;
-        _gridAudit.Rows.Clear();
-
         string? csvFile = curr == "Centralny (Wszystkie)"
             ? Path.Combine(_vaultDir, "central_audit_trail.csv")
             : repos.FirstOrDefault(r => r.Code == curr) is RepositoryInfo r ? Path.Combine(r.RootPath, "._audit_meta", "audit_trail.csv") : null;
 
+        var rows = new List<DataGridViewRow>();
         if (csvFile != null && File.Exists(csvFile))
         {
-            var rows = File.ReadAllLines(csvFile, Encoding.UTF8).Skip(1).Reverse();
-            foreach (var line in rows)
+            foreach (var line in File.ReadAllLines(csvFile, Encoding.UTF8).Skip(1).Reverse())
             {
                 var parts = line.Split(';');
                 if (parts.Length >= 5)
-                    _gridAudit.Rows.Add(parts[0], parts[1], parts[2], parts[3], parts[4]);
+                {
+                    var row = new DataGridViewRow();
+                    row.CreateCells(_gridAudit, parts[0], parts[1], parts[2], parts[3], parts[4]);
+                    rows.Add(row);
+                }
             }
+        }
+
+        _gridAudit.SuspendLayout();
+        try
+        {
+            _gridAudit.Rows.Clear();
+            if (rows.Count > 0)
+                _gridAudit.Rows.AddRange(rows.ToArray());
+        }
+        finally
+        {
+            _gridAudit.ResumeLayout();
         }
     }
 
@@ -1300,7 +1474,7 @@ public class MainForm : Form
     }
 
     // =========================================================================
-    // NARZĘDZIA POMOCNICZE (SHA-256, AUDIT TRAIL, SKANOWANIE)
+    // NARZĘDZIA POMOCNICZE (SHA-256 POOLED, AUDIT TRAIL, SZYBKIE TRAWERSOWANIE)
     // =========================================================================
     private void LogAuditTrail(string repoRoot, string action, string target, string details)
     {
@@ -1329,15 +1503,22 @@ public class MainForm : Form
         catch { }
     }
 
-    private static IEnumerable<string> EnumerateRepoFiles(string rootDir)
+    private static IEnumerable<string> EnumerateRepoFilesFast(string rootDir)
     {
+        var opts = new EnumerationOptions
+        {
+            IgnoreInaccessible = true,
+            AttributesToSkip = FileAttributes.ReparsePoint,
+            RecurseSubdirectories = false
+        };
+
         var stack = new Stack<string>();
         stack.Push(rootDir);
         while (stack.Count > 0)
         {
             string curr = stack.Pop();
             IEnumerable<string> subDirs;
-            try { subDirs = Directory.EnumerateDirectories(curr); }
+            try { subDirs = Directory.EnumerateDirectories(curr, "*", opts); }
             catch { continue; }
 
             foreach (var d in subDirs)
@@ -1348,7 +1529,7 @@ public class MainForm : Form
             }
 
             IEnumerable<string> files;
-            try { files = Directory.EnumerateFiles(curr); }
+            try { files = Directory.EnumerateFiles(curr, "*", opts); }
             catch { continue; }
 
             foreach (var f in files)
@@ -1356,21 +1537,31 @@ public class MainForm : Form
         }
     }
 
-    private static string CalculateSha256Short(string filePath)
+    private static string CalculateSha256Pooled(string filePath, byte[] buffer)
     {
         try
         {
-            using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1048576);
-            byte[] hashBytes = SHA256.HashData(stream);
-            return Convert.ToHexString(hashBytes).ToLowerInvariant()[..16];
+            using var stream = new FileStream(
+                filePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite,
+                bufferSize: buffer.Length,
+                options: FileOptions.SequentialScan);
+
+            using var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            int bytesRead;
+            while ((bytesRead = stream.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                sha.AppendData(buffer, 0, bytesRead);
+            }
+            return Convert.ToHexString(sha.GetHashAndReset()).ToLowerInvariant()[..16];
         }
         catch
         {
             return "ERROR";
         }
     }
-
-    private static int GetWorkerCount() => Math.Min(32, Math.Max(4, Environment.ProcessorCount * 4));
 
     private static double ToUnixTimestamp(DateTime utcTime) =>
         (utcTime - DateTime.UnixEpoch).TotalSeconds;
@@ -1385,24 +1576,34 @@ public class MainForm : Form
         return Regex.Replace(text, @"[\s_]+", "-").ToUpperInvariant();
     }
 
-    private static DataGridView CreateStyledGrid() => new()
+    private static DataGridView CreateStyledGrid()
     {
-        Dock = DockStyle.Fill,
-        AllowUserToAddRows = false,
-        AllowUserToDeleteRows = false,
-        ReadOnly = true,
-        SelectionMode = DataGridViewSelectionMode.FullRowSelect,
-        RowHeadersVisible = false,
-        BackgroundColor = Color.White,
-        BorderStyle = BorderStyle.FixedSingle,
-        AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.None,
-        AllowUserToResizeRows = false
-    };
+        var dgv = new DataGridView
+        {
+            Dock = DockStyle.Fill,
+            AllowUserToAddRows = false,
+            AllowUserToDeleteRows = false,
+            ReadOnly = true,
+            SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+            RowHeadersVisible = false,
+            BackgroundColor = Color.White,
+            BorderStyle = BorderStyle.FixedSingle,
+            AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.None,
+            AllowUserToResizeRows = false
+        };
+        typeof(DataGridView).InvokeMember(
+            "DoubleBuffered",
+            BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.SetProperty,
+            null,
+            dgv,
+            new object[] { true });
+        return dgv;
+    }
 
     private string? PromptAuditReason(int count)
     {
         using var dlg = new Form { Text = "Uzasadnienie zmiany (Audit Trail)", Size = new Size(460, 200), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false };
-        var lbl = new Label { Text = $"Zamierzasz zatwierdzić {count} zmian(y) do nowej Linii Bazowej.\nPodaj powód / komentarz audytowy:", Location = new Point(15, 15), Size = new Size(415, 38) };
+        var lbl = new Label { Text = $"Zamierzasz zatwierdzić {count:N0} zmian(y) do nowej Linii Bazowej.\nPodaj powód / komentarz audytowy:", Location = new Point(15, 15), Size = new Size(415, 38) };
         var txt = new TextBox { PlaceholderText = "np. Aktualizacja po przeglądzie", Location = new Point(15, 60), Size = new Size(415, 26) };
         var btnOk = new Button { Text = "Zatwierdź", DialogResult = DialogResult.OK, Location = new Point(250, 105), Width = 85, Height = 30 };
         var btnCancel = new Button { Text = "Anuluj", DialogResult = DialogResult.Cancel, Location = new Point(345, 105), Width = 85, Height = 30 };
