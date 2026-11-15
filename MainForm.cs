@@ -538,9 +538,22 @@ public class MainForm : Form
 
         var progress = new Progress<ScanProgressReport>(rep =>
         {
-            double mb = rep.ProcessedBytes / (1024.0 * 1024.0);
-            _lblRepoProgress.Text = $"{rep.Phase}\nPliki: {rep.ProcessedFiles:N0} ({mb:N1} MB) | {rep.CurrentFile}";
-        });
+          double doneMb = rep.ProcessedBytes / (1024.0 * 1024.0);
+          double totMb = rep.TotalDiscoveredBytes / (1024.0 * 1024.0);
+
+         if (rep.DiscoveryCompleted && rep.TotalDiscoveredBytes > 0)
+      {
+        int pct = (int)Math.Clamp((rep.ProcessedBytes * 100L) / rep.TotalDiscoveredBytes, 0, 100);
+        _pbRepoProgress.Style = ProgressBarStyle.Continuous;
+        _pbRepoProgress.Value = pct;
+        _lblRepoProgress.Text = $"{rep.Phase}: {pct}% ({rep.SpeedMbPerSec:F0} MB/s)\nPliki: {rep.ProcessedFiles:N0}/{rep.TotalDiscoveredFiles:N0} ({doneMb:N0}/{totMb:N0} MB)";
+       }
+    else
+    {
+        _pbRepoProgress.Style = ProgressBarStyle.Marquee;
+        _lblRepoProgress.Text = $"Katalogowanie paczek (100/paczka)... ({rep.SpeedMbPerSec:F0} MB/s)\nPrzetworzono: {rep.ProcessedFiles:N0} z {rep.TotalDiscoveredFiles:N0} ({doneMb:N0} MB)";
+    }
+});
 
         try
         {
