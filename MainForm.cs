@@ -38,6 +38,7 @@ public class MainForm : Form
     private TextBox _txtRepoCode = null!;
     private TextBox _txtRepoName = null!;
     private TextBox _txtRepoOwner = null!;
+    private ComboBox _cmbResourceProfile = null!;
     private Button _btnCreateRepo = null!;
     private Button _btnCancelRepo = null!;
     private ProgressBar _pbRepoProgress = null!;
@@ -163,7 +164,6 @@ public class MainForm : Form
             ("📜  Historia i Audyt", 4)
         };
 
-        // Dodajemy przyciski nawigacji (od dołu do góry ze względu na DockStyle.Top)
         foreach (var (text, idx) in navItems.Reverse())
         {
             var btn = new Button
@@ -378,14 +378,9 @@ public class MainForm : Form
         formFlow.Controls.Add(_txtRepoName);
 
         formFlow.Controls.Add(MakeFieldLabel("4. Osoba odpowiedzialna / Audytor:"));
-        _txtRepoOwner = new TextBox { Text = _currentUser, Width = 355, Font = UiTheme.FontBase(10f), Margin = new Padding(0, 0, 0, 18) };
-        formFlow.Controls.Add(_txtRepoOwner);
-
-        formFlow.Controls.Add(MakeFieldLabel("4. Osoba odpowiedzialna / Audytor:"));
         _txtRepoOwner = new TextBox { Text = _currentUser, Width = 355, Font = UiTheme.FontBase(10f), Margin = new Padding(0, 0, 0, 12) };
         formFlow.Controls.Add(_txtRepoOwner);
 
-        // ---> TUTAJ WKLEJ PUNKT 2 <---
         formFlow.Controls.Add(MakeFieldLabel("5. Profil przepustowości I/O i pamięci RAM:"));
         _cmbResourceProfile = new ComboBox
         {
@@ -400,11 +395,8 @@ public class MainForm : Form
             "🔵 Zrównoważony (4–8 wątków, bufor 4 MB)",
             "🚀 Maksymalny (8–16 wątków, bufor 8 MB, pełne NVMe)"
         });
-        _cmbResourceProfile.SelectedIndex = 1; // Domyślnie Zrównoważony
+        _cmbResourceProfile.SelectedIndex = 1;
         formFlow.Controls.Add(_cmbResourceProfile);
-        // ---> KONIEC PUNKTU 2 <---
-
-        _btnCreateRepo = UiTheme.CreatePrimaryButton("🛡️ Utwórz Linię Bazową (Baseline)", UiTheme.SuccessGreen, UiTheme.SuccessGreenHover, width: 355, height: 42);
 
         _btnCreateRepo = UiTheme.CreatePrimaryButton("🛡️ Utwórz Linię Bazową (Baseline)", UiTheme.SuccessGreen, UiTheme.SuccessGreenHover, width: 355, height: 42);
         _btnCreateRepo.Click += async (s, e) => await RegisterNewRepositoryAsync();
@@ -504,6 +496,17 @@ public class MainForm : Form
         Margin = new Padding(0, 0, 0, 5)
     };
 
+    private EngineResourceProfile GetSelectedResourceProfile()
+    {
+        var mode = _cmbResourceProfile?.SelectedIndex switch
+        {
+            0 => ResourceProfileMode.Eco,
+            2 => ResourceProfileMode.Maximum,
+            _ => ResourceProfileMode.Balanced
+        };
+        return EngineResourceProfile.FromMode(mode);
+    }
+
     private void PickRepoFolder()
     {
         using var fbd = new FolderBrowserDialog { Description = "Wybierz katalog do nadzoru" };
@@ -521,18 +524,6 @@ public class MainForm : Form
     }
 
     private async Task RegisterNewRepositoryAsync()
-
-    private EngineResourceProfile GetSelectedResourceProfile()
-{
-    var mode = _cmbResourceProfile?.SelectedIndex switch
-    {
-        0 => ResourceProfileMode.Eco,
-        2 => ResourceProfileMode.Maximum,
-        _ => ResourceProfileMode.Balanced
-    };
-    return EngineResourceProfile.FromMode(mode);
-}
-
     {
         if (_repoCreationCts != null) return;
         if (string.IsNullOrEmpty(_selectedNewRepoDir) || !Directory.Exists(_selectedNewRepoDir))
@@ -829,6 +820,7 @@ public class MainForm : Form
         _isScanning = true;
         _auditScanCts = new CancellationTokenSource();
         var ct = _auditScanCts.Token;
+        var profile = GetSelectedResourceProfile();
 
         _btnScanFast.Enabled = false;
         _btnScanDeep.Enabled = false;
@@ -839,7 +831,7 @@ public class MainForm : Form
 
         var progress = new Progress<int>(count =>
         {
-            _lblMonSummary.Text = $"Skanowanie... zweryfikowano {count:N0} plików";
+            _lblMonSummary.Text = $"Skanowanie ({profile.WorkerCount} wątków)... zweryfikowano {count:N0} plików";
         });
 
         try
@@ -855,13 +847,12 @@ public class MainForm : Form
                 long totalBytes = 0;
                 long lastReportTicks = 0;
 
-                int workerCount = Math.Clamp(Environment.ProcessorCount / 2, 2, 6);
-                var parallelOpts = new ParallelOptions { MaxDegreeOfParallelism = workerCount, CancellationToken = ct };
+                var parallelOpts = new ParallelOptions { MaxDegreeOfParallelism = profile.WorkerCount, CancellationToken = ct };
 
                 Parallel.ForEach(
                     EnumerateRepoFilesFast(repo.RootPath),
                     parallelOpts,
-                    () => ArrayPool<byte>.Shared.Rent(262144),
+                    () => ArrayPool<byte>.Shared.Rent(profile.ReadBufferBytes),
                     (fPath, state, buffer) =>
                     {
                         try
@@ -886,11 +877,20 @@ public class MainForm : Form
                                 string fileState;
 
                                 if (!needsHash && !mtimeOnly)
+                                {
                                     fileState = "ZGODNY";
+                                }
                                 else if (mtimeOnly && mtimeChanged && currSize == bRow.FileSize)
+                                {
                                     fileState = "ZMIENIONY";
+                                }
                                 else
-                                    fileState = CalculateSha256Pooled(fPath, buffer) != bRow.FileHash ? "ZMIENIONY" : "ZGODNY";
+                                {
+                                    string currHash = currSize >= 1024 * 1024
+                                        ? RepositoryEngine.CalculateSha256MemoryMapped(fPath, currSize)
+                                        : RepositoryEngine.CalculateSha256RandomAccess(fPath, buffer);
+                                    fileState = currHash != bRow.FileHash ? "ZMIENIONY" : "ZGODNY";
+                                }
 
                                 if (fileState == "ZGODNY")
                                 {
@@ -1177,14 +1177,18 @@ public class MainForm : Form
                     if (item.State == "NOWY" && File.Exists(item.AbsPath))
                     {
                         var fi = new FileInfo(item.AbsPath);
-                        string hash = CalculateSha256Pooled(item.AbsPath, buffer);
+                        string hash = fi.Length >= 1024 * 1024
+                            ? RepositoryEngine.CalculateSha256MemoryMapped(item.AbsPath, fi.Length)
+                            : RepositoryEngine.CalculateSha256RandomAccess(item.AbsPath, buffer);
                         newInserts.Add((item.RepoId, item.FullRelPath, item.Filename, hash, fi.Length, ToUnixTimestamp(fi.LastWriteTimeUtc), nowStr, _currentUser));
                         LogAuditTrail(repoRoot, "BASELINE_ADD_NEW", item.FullRelPath, $"Zatwierdzono nowy plik | Powód: {reason}");
                     }
                     else if (item.State == "ZMIENIONY" && File.Exists(item.AbsPath) && item.DbId.HasValue)
                     {
                         var fi = new FileInfo(item.AbsPath);
-                        string hash = CalculateSha256Pooled(item.AbsPath, buffer);
+                        string hash = fi.Length >= 1024 * 1024
+                            ? RepositoryEngine.CalculateSha256MemoryMapped(item.AbsPath, fi.Length)
+                            : RepositoryEngine.CalculateSha256RandomAccess(item.AbsPath, buffer);
                         modUpdates.Add((hash, fi.Length, ToUnixTimestamp(fi.LastWriteTimeUtc), nowStr, _currentUser, item.DbId.Value));
                         LogAuditTrail(repoRoot, "BASELINE_ACCEPT_MODIFIED", item.FullRelPath, $"Zatwierdzono modyfikację (nowy hash: {hash}) | Powód: {reason}");
                     }
@@ -1461,7 +1465,6 @@ public class MainForm : Form
         top.Controls.Add(topFlow);
         top.Controls.Add(btnCsv);
 
-        // Karty KPI z lewym paskiem akcentu
         var kpiTable = new TableLayoutPanel { Dock = DockStyle.Top, Height = 104, ColumnCount = 5, RowCount = 1, Padding = new Padding(0, 4, 0, 8) };
         for (int i = 0; i < 5; i++) kpiTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 20f));
 
@@ -1471,7 +1474,6 @@ public class MainForm : Form
         kpiTable.Controls.Add(UiTheme.CreateKpiCard("NOWE / NIEZATWIERDZONE", Color.FromArgb(2, 132, 199), out _kpiNewV, out _kpiNewS), 3, 0);
         kpiTable.Controls.Add(UiTheme.CreateKpiCard("USUNIĘTE Z DYSKU", UiTheme.DangerRed, out _kpiDelV, out _kpiDelS), 4, 0);
 
-        // Karta wykresu trendu
         var chartCard = UiTheme.CreateCardPanel(new Padding(12));
         chartCard.Dock = DockStyle.Top;
         chartCard.Height = 215;
@@ -1488,7 +1490,6 @@ public class MainForm : Form
         chartCard.Controls.Add(_chartPanel);
         chartCard.Controls.Add(chartHdr);
 
-        // Karta dziennika migawek
         var gridCard = UiTheme.CreateCardPanel(new Padding(14));
         gridCard.Dock = DockStyle.Fill;
 
