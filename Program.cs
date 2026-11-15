@@ -10,7 +10,10 @@ internal static class Program
         using var login = new SessionLoginDialog();
         if (login.ShowDialog() != DialogResult.OK || string.IsNullOrWhiteSpace(login.OperatorName))
             return;
-
+Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (s, e) =>
+            MessageBox.Show($"Wystąpił błąd aplikacji:\n\n{e.Exception.Message}\n\n{e.Exception.StackTrace}",
+                "Błąd", MessageBoxButtons.OK, MessageBoxIcon.Error);
         Application.Run(new MainForm(login.OperatorName));
     }
 }
